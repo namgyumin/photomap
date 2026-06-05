@@ -1,25 +1,60 @@
 {
   "expo": {
-    "name": "photomap",
+    "name": "photoMap",
     "slug": "photomap",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
+    "scheme": "photomap",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.namgyumin.photomap",
+      "config": {
+        "googleMapsApiKey": "$(GOOGLE_MAPS_API_KEY)"
+      }
     },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundImage": "./assets/android-icon-background.png"
       },
-      "predictiveBackGestureEnabled": false
+      "package": "com.namgyumin.photomap",
+      "config": {
+        "googleMaps": {
+          "apiKey": "$(GOOGLE_MAPS_API_KEY)"
+        }
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "react-native-maps",
+        {
+          "googleMapsApiKey": "$(GOOGLE_MAPS_API_KEY)"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "장소를 추천하기 위해 현재 위치를 사용합니다.",
+          "locationAlwaysAndWhenInUsePermission": "장소를 추천하기 위해 현재 위치를 사용합니다."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "오늘 간 장소에 사진을 추가하기 위해 사진 라이브러리에 접근합니다."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
     }
   }
 }
