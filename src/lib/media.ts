@@ -1,6 +1,9 @@
+import { decode } from 'base64-arraybuffer'
+import * as FileSystem from 'expo-file-system'
 import * as ImagePicker from 'expo-image-picker'
-import { supabaseUrl } from './config'
 import type { MediaType } from '../types/database'
+import { supabase } from './supabase'
+import { supabaseUrl } from './config'
 
 export const MAX_VIDEO_SECONDS = 10
 
@@ -36,7 +39,6 @@ export async function pickMedia(): Promise<PickedMedia | null> {
 
   const asset = result.assets[0]
   const isVideo = asset.type === 'video'
-  // expo-image-picker duration 은 밀리초
   const durationSeconds =
     asset.duration != null ? Math.round((asset.duration / 1000) * 10) / 10 : null
 
@@ -58,8 +60,44 @@ export async function pickMedia(): Promise<PickedMedia | null> {
   }
 }
 
+function getMimeType(uri: string, mediaType: MediaType): string {
+  if (mediaType === 'video') {
+    if (uri.toLowerCase().endsWith('.mov')) return 'video/quicktime'
+    return 'video/mp4'
+  }
+  if (uri.toLowerCase().endsWith('.png')) return 'image/png'
+  return 'image/jpeg'
+}
+
+// 로컬 URI → Supabase Storage 업로드. storagePath 반환 (bucket 내 경로).
+export async function uploadMedia(
+  userId: string,
+  visitId: string,
+  localUri: string,
+  mediaType: MediaType
+): Promise<string> {
+  const ext = mediaType === 'video' ? 'mp4' : 'jpg'
+  const filename = `${Date.now()}.${ext}`
+  const storagePath = `${userId}/${visitId}/${filename}`
+
+  const base64 = await FileSystem.readAsStringAsync(localUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  })
+
+  const mimeType = getMimeType(localUri, mediaType)
+
+  const { error } = await supabase.storage
+    .from('visit-photos')
+    .upload(storagePath, decode(base64), {
+      contentType: mimeType,
+      upsert: false,
+    })
+
+  if (error) throw error
+  return storagePath
+}
+
 // storage_path → 렌더링 가능한 URI 해석.
-// 로컬 uri(file:/content:/http) 면 그대로, 아니면 supabase storage public URL 로 가정.
 export function resolveMediaUri(storagePath: string | null): string | null {
   if (!storagePath) return null
   if (
@@ -71,5 +109,5 @@ export function resolveMediaUri(storagePath: string | null): string | null {
     return storagePath
   }
   if (!supabaseUrl) return null
-  return `${supabaseUrl}/storage/v1/object/public/media/${storagePath}`
+  return `${supabaseUrl}/storage/v1/object/public/visit-photos/${storagePath}`
 }
