@@ -28,7 +28,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Detect EAS project
+        id: eas_project
+        run: |
+          if node -e "const c=require('./app.json').expo || {}; process.exit(c.extra?.eas?.projectId ? 0 : 1)"; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "EAS project is not configured yet; skipping preview build. Run 'eas init' and commit app.json extra.eas.projectId to enable this check."
+          fi
+
       - name: Build preview
+        if: steps.eas_project.outputs.configured == 'true'
         run: eas build --platform ios --profile preview --non-interactive
         env:
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
