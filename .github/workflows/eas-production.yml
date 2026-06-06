@@ -17,7 +17,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: photomap/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Setup Expo
         uses: expo/expo-github-action@v8
@@ -27,11 +27,9 @@ jobs:
           token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install dependencies
-        working-directory: photomap
         run: npm ci
 
       - name: Build production
-        working-directory: photomap
         run: eas build --platform ios --profile production --non-interactive
         env:
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
