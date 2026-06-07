@@ -13,6 +13,7 @@ import {
   TextInput,
   View,
 } from 'react-native'
+import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps'
 import type { PlaceSearchResult } from '../lib/googlePlaces'
 import { MAX_VIDEO_SECONDS, pickMedia, resolveMediaUri, uploadMedia, VideoTooLongError } from '../lib/media'
 import {
@@ -20,6 +21,8 @@ import {
   createOrGetPlace,
   createShareLink,
   createVisitMemory,
+  deleteMedia,
+  deleteVisitMemory,
   getMemoryDetail,
   setHeroMedia,
   updateMediaLocation,
@@ -169,16 +172,20 @@ export function PlaceDetailSheet({
       const picked = await pickMedia()
       if (!picked) return
 
-      // Upload to Supabase Storage
-      const storagePath = await uploadMedia(userId!, currentId, picked.uri, picked.mediaType)
+      const uploaded = await uploadMedia(userId!, currentId, picked.uri, picked.mediaType)
 
       await addMediaToVisit({
         visitId: currentId,
-        storagePath,
+        storagePath: uploaded.storagePath,
         mediaType: picked.mediaType,
         durationSeconds: picked.durationSeconds,
+        thumbnail128: uploaded.thumbnail128,
+        thumbnail512: uploaded.thumbnail512,
         width: picked.width,
         height: picked.height,
+        capturedAt: picked.capturedAt,
+        latitude: picked.latitude,
+        longitude: picked.longitude,
       })
       await load(currentId)
       onChanged?.()
@@ -235,7 +242,45 @@ export function PlaceDetailSheet({
     }
   }
 
+  const handleDeleteMedia = async (mediaItem: Media) => {
+    Alert.alert('미디어 삭제', '이 사진/영상을 삭제할까요?', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: () => {
+          if (!currentId) return
+          void deleteMedia(mediaItem)
+            .then(() => load(currentId))
+            .then(() => onChanged?.())
+            .catch((e) => Alert.alert('삭제 실패', String((e as Error).message)))
+        },
+      },
+    ])
+  }
+
+  const handleDeleteVisit = async () => {
+    if (!currentId) return
+    Alert.alert('기록 삭제', '이 장소 기록과 연결된 미디어를 삭제할까요?', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: () => {
+          void deleteVisitMemory(currentId)
+            .then(() => {
+              onChanged?.()
+              onClose()
+            })
+            .catch((e) => Alert.alert('삭제 실패', String((e as Error).message)))
+        },
+      },
+    ])
+  }
+
   const media = detail?.media ?? []
+  const placeLat = detail?.place?.latitude ?? searchPlace?.latitude ?? null
+  const placeLng = detail?.place?.longitude ?? searchPlace?.longitude ?? null
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -266,6 +311,36 @@ export function PlaceDetailSheet({
                 <Text style={styles.label}>위치</Text>
                 <Text style={styles.value}>{placeAddress ?? '주소 정보 없음'}</Text>
               </View>
+
+              {placeLat != null && placeLng != null ? (
+                <View style={styles.field}>
+                  <Text style={styles.label}>작은 지도</Text>
+                  <MapView
+                    provider={PROVIDER_GOOGLE}
+                    style={styles.miniMap}
+                    scrollEnabled={false}
+                    zoomEnabled={false}
+                    pitchEnabled={false}
+                    rotateEnabled={false}
+                    initialRegion={{
+                      latitude: placeLat,
+                      longitude: placeLng,
+                      latitudeDelta: 0.008,
+                      longitudeDelta: 0.008,
+                    }}
+                  >
+                    <Marker coordinate={{ latitude: placeLat, longitude: placeLng }} />
+                  </MapView>
+                </View>
+              ) : null}
+
+              {detail ? (
+                <View style={styles.timelineBox}>
+                  <Text style={styles.label}>내 방문 기록</Text>
+                  <Text style={styles.timelineText}>방문일 {visitedAt}</Text>
+                  <Text style={styles.timelineText}>사진/영상 {media.length}개</Text>
+                </View>
+              ) : null}
 
               <View style={styles.fieldRow}>
                 <Text style={styles.label}>저장</Text>
@@ -312,6 +387,12 @@ export function PlaceDetailSheet({
                   <Text style={styles.ghostText}>공유</Text>
                 </Pressable>
               </View>
+
+              {currentId ? (
+                <Pressable style={styles.deleteVisitBtn} onPress={handleDeleteVisit}>
+                  <Text style={styles.deleteVisitText}>기록 삭제</Text>
+                </Pressable>
+              ) : null}
 
               {/* 사진/영상 리스트 */}
               <View style={styles.mediaHeader}>
@@ -360,8 +441,14 @@ export function PlaceDetailSheet({
                             {isHero ? '★ 대표 사진' : '대표로 설정'}
                           </Text>
                         </Pressable>
+                        {m.captured_at ? (
+                          <Text style={styles.mediaCoords}>{`촬영: ${m.captured_at.slice(0, 10)}`}</Text>
+                        ) : null}
                         <Pressable onPress={() => handleUsePlaceLocation(m)}>
                           <Text style={styles.locationBtn}>장소 위치 사용</Text>
+                        </Pressable>
+                        <Pressable onPress={() => handleDeleteMedia(m)}>
+                          <Text style={styles.deleteMediaBtn}>삭제</Text>
                         </Pressable>
                       </View>
                     </View>
@@ -411,6 +498,16 @@ const styles = StyleSheet.create({
   },
   label: { fontSize: 13, color: '#888', marginBottom: 4 },
   value: { fontSize: 15, color: '#222' },
+  miniMap: { width: '100%', height: 130, borderRadius: 12, overflow: 'hidden' },
+  timelineBox: {
+    borderWidth: 1,
+    borderColor: '#edf0f3',
+    backgroundColor: '#fafafa',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  timelineText: { fontSize: 13, color: '#555', marginTop: 2 },
   input: {
     borderWidth: 1,
     borderColor: '#e0e0e0',
@@ -448,4 +545,7 @@ const styles = StyleSheet.create({
   heroBtnActive: { color: '#f5a623' },
   mediaCoords: { fontSize: 11, color: '#999', marginBottom: 4 },
   locationBtn: { color: '#34a853', fontSize: 13, fontWeight: '600', marginTop: 4 },
+  deleteMediaBtn: { color: '#d93025', fontSize: 13, fontWeight: '600', marginTop: 4 },
+  deleteVisitBtn: { alignSelf: 'center', marginTop: -8, marginBottom: 20, paddingVertical: 8 },
+  deleteVisitText: { color: '#d93025', fontSize: 13, fontWeight: '600' },
 })

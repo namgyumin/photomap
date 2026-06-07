@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Keyboard,
   Pressable,
   StyleSheet,
@@ -188,16 +189,25 @@ export default function MapScreen() {
         initialRegion={SEOUL}
         showsUserLocation
       >
-        {savedMarkers.map((m) => (
-          <Marker
-            key={m.memoryId}
-            coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
-            title={m.place.name}
-            pinColor="#1a73e8"
-            tracksViewChanges={false}
-            onPress={() => openSavedMarker(m)}
-          />
-        ))}
+        {savedMarkers.map((m) => {
+          const thumb = m.place.heroPhotoUrl
+          return (
+            <Marker
+              key={m.memoryId}
+              coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
+              title={m.place.name}
+              pinColor="#1a73e8"
+              tracksViewChanges={false}
+              onPress={() => openSavedMarker(m)}
+            >
+              {thumb ? (
+                <View style={styles.photoMarker}>
+                  <Image source={{ uri: thumb }} style={styles.photoMarkerImage} />
+                </View>
+              ) : undefined}
+            </Marker>
+          )
+        })}
         {results.map((r) => (
           <Marker
             key={r.googlePlaceId}
@@ -260,6 +270,16 @@ export default function MapScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   map: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  photoMarker: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    borderWidth: 3,
+    borderColor: '#fff',
+    overflow: 'hidden',
+    backgroundColor: '#1a73e8',
+  },
+  photoMarkerImage: { width: '100%', height: '100%' },
   searchBar: {
     position: 'absolute',
     top: 50,

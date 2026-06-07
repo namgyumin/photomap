@@ -206,6 +206,37 @@ export async function updateMediaLocation(
   return data as Media
 }
 
+function isStoragePath(path: string | null): path is string {
+  return Boolean(path) && !path!.startsWith('http') && !path!.startsWith('file:')
+}
+
+export async function deleteMedia(media: Media): Promise<void> {
+  const paths = [media.storage_path, media.thumbnail_128, media.thumbnail_512].filter(isStoragePath)
+
+  const { error: dbErr } = await supabase.from('visit_photos').delete().eq('id', media.id)
+  if (dbErr) throw dbErr
+
+  if (paths.length > 0) {
+    const { error: storageErr } = await supabase.storage.from('visit-photos').remove(paths)
+    if (storageErr) throw storageErr
+  }
+}
+
+export async function deleteVisitMemory(memoryId: string): Promise<void> {
+  const detail = await getMemoryDetail(memoryId)
+  const paths = detail.media
+    .flatMap((m) => [m.storage_path, m.thumbnail_128, m.thumbnail_512])
+    .filter(isStoragePath)
+
+  const { error } = await supabase.from('visits').delete().eq('id', memoryId)
+  if (error) throw error
+
+  if (paths.length > 0) {
+    const { error: storageErr } = await supabase.storage.from('visit-photos').remove(paths)
+    if (storageErr) throw storageErr
+  }
+}
+
 // ============================================================
 // 조회
 // ============================================================
