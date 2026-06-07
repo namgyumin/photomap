@@ -1,11 +1,11 @@
-name: EAS Production Build
+name: EAS Android Production Build
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: EAS Production (iOS)
+    name: EAS Production (Android)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +33,11 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "EAS project is not configured yet; skipping production build. Run 'eas init' and commit app.json extra.eas.projectId to enable this workflow."
+            echo "EAS project is not configured yet; skipping Android production build. Run 'eas init' and commit app.json extra.eas.projectId to enable this workflow."
           fi
 
-      - name: Build production
+      - name: Build Android production AAB
         if: steps.eas_project.outputs.configured == 'true'
-        run: eas build --platform ios --profile production --non-interactive
+        run: eas build --platform android --profile production --non-interactive
         env:
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}

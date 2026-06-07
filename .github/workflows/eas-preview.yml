@@ -1,4 +1,4 @@
-name: EAS Preview Build
+name: EAS Android Preview Build
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: EAS Preview (iOS)
+    name: EAS Preview (Android)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,11 +35,11 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "EAS project is not configured yet; skipping preview build. Run 'eas init' and commit app.json extra.eas.projectId to enable this check."
+            echo "EAS project is not configured yet; skipping Android preview build. Run 'eas init' and commit app.json extra.eas.projectId to enable this check."
           fi
 
-      - name: Build preview
+      - name: Build Android preview APK
         if: steps.eas_project.outputs.configured == 'true'
-        run: eas build --platform ios --profile preview --non-interactive
+        run: eas build --platform android --profile preview --non-interactive
         env:
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
