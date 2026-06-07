@@ -8,7 +8,3 @@ export const googleMapsApiKey: string =
 export const hasGoogleMapsKey = googleMapsApiKey.length > 0
 
 export const supabaseUrl: string = process.env.EXPO_PUBLIC_SUPABASE_URL ?? ''
-export const supabaseAnonKey: string = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? ''
-
-// Edge Function base URL (set when Supabase URL is configured)
-export const edgeFunctionUrl: string = supabaseUrl ? `${supabaseUrl}/functions/v1` : ''
