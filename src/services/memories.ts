@@ -219,7 +219,7 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
     .from('visits')
     .select(
       `id, visited_at, note, amount_spent, hero_media_id,
-       place:places(id, display_name, address),
+       place:places(id, display_name, address, latitude, longitude),
        media:visit_photos(id, thumbnail_512, storage_path, sort_order)`
     )
     .eq('user_id', userId)
@@ -232,7 +232,7 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
     note: string | null
     amount_spent: number | null
     hero_media_id: string | null
-    place: { id: string; display_name: string | null; address: string | null } | null
+    place: { id: string; display_name: string | null; address: string | null; latitude: number | null; longitude: number | null } | null
     media: Array<{ id: string; thumbnail_512: string | null; storage_path: string; sort_order: number }>
   }>
 
@@ -249,7 +249,13 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
       amount_spent: r.amount_spent,
       hero_media_id: r.hero_media_id,
       place: r.place
-        ? { id: r.place.id, display_name: r.place.display_name, address: r.place.address }
+        ? {
+            id: r.place.id,
+            display_name: r.place.display_name,
+            address: r.place.address,
+            latitude: r.place.latitude,
+            longitude: r.place.longitude,
+          }
         : null,
       hero: hero
         ? { id: hero.id, thumbnail_512: hero.thumbnail_512, storage_path: hero.storage_path }
@@ -257,6 +263,29 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
       media_count: media.length,
     }
   })
+}
+
+export interface MapMarker {
+  memoryId: string
+  placeId: string
+  displayName: string
+  latitude: number
+  longitude: number
+  heroThumbnail: string | null
+}
+
+export async function loadMapMarkers(): Promise<MapMarker[]> {
+  const memories = await listMyMemories()
+  return memories
+    .filter((m) => m.place?.latitude != null && m.place?.longitude != null)
+    .map((m) => ({
+      memoryId: m.id,
+      placeId: m.place!.id,
+      displayName: m.place!.display_name ?? '장소',
+      latitude: m.place!.latitude!,
+      longitude: m.place!.longitude!,
+      heroThumbnail: m.hero?.thumbnail_512 ?? m.hero?.storage_path ?? null,
+    }))
 }
 
 export async function getMemoryDetail(memoryId: string): Promise<MemoryDetail> {

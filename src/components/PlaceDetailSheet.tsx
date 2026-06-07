@@ -14,7 +14,7 @@ import {
   View,
 } from 'react-native'
 import type { PlaceSearchResult } from '../lib/googlePlaces'
-import { MAX_VIDEO_SECONDS, pickMedia, resolveMediaUri, VideoTooLongError } from '../lib/media'
+import { MAX_VIDEO_SECONDS, pickMedia, resolveMediaUri, uploadMedia, VideoTooLongError } from '../lib/media'
 import {
   addMediaToVisit,
   createOrGetPlace,
@@ -168,9 +168,13 @@ export function PlaceDetailSheet({
     try {
       const picked = await pickMedia()
       if (!picked) return
+
+      // Upload to Supabase Storage
+      const storagePath = await uploadMedia(userId!, currentId, picked.uri, picked.mediaType)
+
       await addMediaToVisit({
         visitId: currentId,
-        storagePath: picked.uri,
+        storagePath,
         mediaType: picked.mediaType,
         durationSeconds: picked.durationSeconds,
         width: picked.width,
