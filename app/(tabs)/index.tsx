@@ -16,7 +16,6 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import { PlaceDetailSheet } from '../../src/components/PlaceDetailSheet'
 import { hasGoogleMapsKey } from '../../src/lib/config'
 import { searchPlaces, type PlaceSearchResult } from '../../src/lib/googlePlaces'
-import { loadMapMarkers, type MapMarker } from '../../src/services/memories'
 import { useAuth } from '../../src/hooks/useAuth'
 
 const SEOUL: Region = {
@@ -31,20 +30,6 @@ interface SavedMarker {
   place: PlaceSearchResult
 }
 
-function markerFromMapMarker(m: MapMarker): SavedMarker {
-  return {
-    memoryId: m.memoryId,
-    place: {
-      googlePlaceId: m.placeId,
-      name: m.displayName,
-      address: null,
-      latitude: m.latitude,
-      longitude: m.longitude,
-      heroPhotoUrl: m.heroThumbnail,
-    },
-  }
-}
-
 export default function MapScreen() {
   const { userId } = useAuth()
   const router = useRouter()
@@ -55,41 +40,17 @@ export default function MapScreen() {
   const [searching, setSearching] = useState(false)
   const [results, setResults] = useState<PlaceSearchResult[]>([])
   const [savedMarkers, setSavedMarkers] = useState<SavedMarker[]>([])
-  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null)
 
+  // 선택된 장소 (검색 결과) 또는 기존 메모리
   const [sheetPlace, setSheetPlace] = useState<PlaceSearchResult | null>(null)
   const [sheetMemoryId, setSheetMemoryId] = useState<string | null>(null)
   const [sheetOpen, setSheetOpen] = useState(false)
 
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  // 위치 권한 요청 + 현재 위치 획득
+  // 단계 1: 위치 권한 요청 UX만 수행한다.
+  // 현재 위치 기반 검색 bias/DB 마커 로드는 단계 2 범위라 여기서는 하지 않는다.
   useEffect(() => {
-    Location.requestForegroundPermissionsAsync()
-      .then(({ status }) => {
-        if (status !== 'granted') return
-        return Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced })
-      })
-      .then((pos) => {
-        if (!pos) return
-        const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude }
-        setUserLocation(loc)
-        mapRef.current?.animateToRegion({
-          ...loc,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        })
-      })
-      .catch(() => {})
+    Location.requestForegroundPermissionsAsync().catch(() => {})
   }, [])
-
-  // DB에서 내 기록 마커 로드
-  useEffect(() => {
-    if (!userId) return
-    loadMapMarkers()
-      .then((markers) => setSavedMarkers(markers.map(markerFromMapMarker)))
-      .catch(() => {})
-  }, [userId])
 
   // 리스트 탭에서 넘어온 메모리 열기
   useEffect(() => {
@@ -97,61 +58,39 @@ export default function MapScreen() {
       setSheetMemoryId(params.openMemoryId)
       setSheetPlace(null)
       setSheetOpen(true)
+      // param 소비
       router.setParams({ openMemoryId: undefined })
     }
   }, [params.openMemoryId, router])
 
-  const doSearch = useCallback(
-    async (q: string) => {
-      if (!q.trim()) return
-      if (!hasGoogleMapsKey) {
-        Alert.alert(
-          '검색 비활성화',
-          'Google Maps API 키가 설정되지 않았어요. GOOGLE_MAPS_API_KEY 를 설정해주세요.'
-        )
-        return
-      }
-      setSearching(true)
-      try {
-        const res = await searchPlaces(q, userLocation ?? undefined)
-        setResults(res)
-        if (res[0]) {
-          mapRef.current?.animateToRegion({
-            latitude: res[0].latitude,
-            longitude: res[0].longitude,
-            latitudeDelta: 0.02,
-            longitudeDelta: 0.02,
-          })
-        }
-      } catch (e) {
-        Alert.alert('검색 실패', String((e as Error).message))
-      } finally {
-        setSearching(false)
-      }
-    },
-    [userLocation]
-  )
-
-  const handleSearchInput = useCallback(
-    (text: string) => {
-      setQuery(text)
-      if (debounceRef.current) clearTimeout(debounceRef.current)
-      if (!text.trim()) {
-        setResults([])
-        return
-      }
-      debounceRef.current = setTimeout(() => {
-        void doSearch(text)
-      }, 300)
-    },
-    [doSearch]
-  )
-
-  const handleSearchSubmit = useCallback(() => {
+  const handleSearch = useCallback(async () => {
     Keyboard.dismiss()
-    if (debounceRef.current) clearTimeout(debounceRef.current)
-    void doSearch(query)
-  }, [query, doSearch])
+    if (!query.trim()) return
+    if (!hasGoogleMapsKey) {
+      Alert.alert(
+        '검색 비활성화',
+        'Google Maps API 키가 설정되지 않았어요. GOOGLE_MAPS_API_KEY 를 설정해주세요.'
+      )
+      return
+    }
+    setSearching(true)
+    try {
+      const res = await searchPlaces(query)
+      setResults(res)
+      if (res[0]) {
+        mapRef.current?.animateToRegion({
+          latitude: res[0].latitude,
+          longitude: res[0].longitude,
+          latitudeDelta: 0.02,
+          longitudeDelta: 0.02,
+        })
+      }
+    } catch (e) {
+      Alert.alert('검색 실패', String((e as Error).message))
+    } finally {
+      setSearching(false)
+    }
+  }, [query])
 
   const openSearchPlace = (p: PlaceSearchResult) => {
     setResults([])
@@ -186,7 +125,6 @@ export default function MapScreen() {
         provider={PROVIDER_GOOGLE}
         style={styles.map}
         initialRegion={SEOUL}
-        showsUserLocation
       >
         {savedMarkers.map((m) => (
           <Marker
@@ -194,7 +132,6 @@ export default function MapScreen() {
             coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
             title={m.place.name}
             pinColor="#1a73e8"
-            tracksViewChanges={false}
             onPress={() => openSavedMarker(m)}
           />
         ))}
@@ -204,7 +141,6 @@ export default function MapScreen() {
             coordinate={{ latitude: r.latitude, longitude: r.longitude }}
             title={r.name}
             description={r.address ?? undefined}
-            tracksViewChanges={false}
             onPress={() => openSearchPlace(r)}
           />
         ))}
@@ -216,11 +152,11 @@ export default function MapScreen() {
           style={styles.searchInput}
           placeholder="장소 검색"
           value={query}
-          onChangeText={handleSearchInput}
-          onSubmitEditing={handleSearchSubmit}
+          onChangeText={setQuery}
+          onSubmitEditing={handleSearch}
           returnKeyType="search"
         />
-        <Pressable style={styles.searchBtn} onPress={handleSearchSubmit}>
+        <Pressable style={styles.searchBtn} onPress={handleSearch}>
           {searching ? (
             <ActivityIndicator color="#fff" />
           ) : (
@@ -233,11 +169,7 @@ export default function MapScreen() {
       {results.length > 0 && (
         <View style={styles.resultList}>
           {results.slice(0, 6).map((r) => (
-            <Pressable
-              key={r.googlePlaceId}
-              style={styles.resultItem}
-              onPress={() => openSearchPlace(r)}
-            >
+            <Pressable key={r.googlePlaceId} style={styles.resultItem} onPress={() => openSearchPlace(r)}>
               <Text style={styles.resultName}>{r.name}</Text>
               {r.address ? <Text style={styles.resultAddr}>{r.address}</Text> : null}
             </Pressable>
@@ -301,12 +233,7 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
   },
-  resultItem: {
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
+  resultItem: { paddingHorizontal: 14, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
   resultName: { fontSize: 15, fontWeight: '600', color: '#222' },
   resultAddr: { fontSize: 13, color: '#888', marginTop: 2 },
 })

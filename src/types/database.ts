@@ -110,10 +110,7 @@ export interface MemoryListItem {
   note: string | null
   amount_spent: number | null
   hero_media_id: string | null
-  place: (Pick<Place, 'id' | 'display_name' | 'address'> & {
-    latitude: number | null
-    longitude: number | null
-  }) | null
+  place: Pick<Place, 'id' | 'display_name' | 'address'> | null
   hero: Pick<Media, 'id' | 'thumbnail_512' | 'storage_path'> | null
   media_count: number
 }
