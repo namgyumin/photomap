@@ -1,17 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage'
-import * as AppleAuthentication from 'expo-apple-authentication'
-import * as Crypto from 'expo-crypto'
+import { makeRedirectUri } from 'expo-auth-session'
+import * as Linking from 'expo-linking'
 import * as WebBrowser from 'expo-web-browser'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
   View,
 } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
+import { useLocalSearchParams, useRouter } from 'expo-router'
 import { supabase } from '../../src/lib/supabase'
 
 WebBrowser.maybeCompleteAuthSession()
@@ -37,10 +37,48 @@ const SLIDES = [
 ]
 
 export default function LoginScreen() {
+  const router = useRouter()
+  const params = useLocalSearchParams<{ next?: string }>()
+  const paramsRef = useRef<string | undefined>(undefined)
   const [slide, setSlide] = useState(0)
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [ready, setReady] = useState(false)
   const [loading, setLoading] = useState(false)
+
+  const applySessionFromUrl = useCallback(async (url: string | null | undefined) => {
+    if (!url) return false
+
+    const hashPart = url.includes('#')
+      ? url.split('#')[1]
+      : url.split('?')[1] ?? ''
+
+    if (!hashPart) return false
+
+    const params = new URLSearchParams(hashPart)
+    const accessToken = params.get('access_token')
+    const refreshToken = params.get('refresh_token')
+
+    if (!accessToken || !refreshToken) return false
+
+    const { error } = await supabase.auth.setSession({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    })
+
+    if (error) throw error
+
+    const nextPath = typeof paramsRef.current === 'string' ? paramsRef.current : ''
+    if (nextPath) {
+      router.replace(nextPath as '/(tabs)' | '/(tabs)/memories' | `/share/${string}`)
+    }
+
+    setLoading(false)
+    return true
+  }, [router])
+
+  useEffect(() => {
+    paramsRef.current = typeof params.next === 'string' ? params.next : undefined
+  }, [params.next])
 
   useEffect(() => {
     AsyncStorage.getItem(ONBOARDING_KEY).then((done) => {
@@ -49,71 +87,46 @@ export default function LoginScreen() {
     }).catch(() => setReady(true))
   }, [])
 
+  useEffect(() => {
+    Linking.getInitialURL()
+      .then((url) => applySessionFromUrl(url))
+      .catch(() => {})
+
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      void applySessionFromUrl(url).catch((e: unknown) => {
+        const err = e as { message?: string }
+        Alert.alert('로그인 실패', err?.message ?? '오류가 발생했어요.')
+        setLoading(false)
+      })
+    })
+
+    return () => {
+      sub.remove()
+    }
+  }, [applySessionFromUrl])
+
   const finishOnboarding = async () => {
     await AsyncStorage.setItem(ONBOARDING_KEY, '1').catch(() => {})
     setShowOnboarding(false)
   }
 
-  const handleAppleSignIn = async () => {
-    try {
-      setLoading(true)
-      const rawNonce = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2)
-      const hashedNonce = await Crypto.digestStringAsync(
-        Crypto.CryptoDigestAlgorithm.SHA256,
-        rawNonce
-      )
-      const credential = await AppleAuthentication.signInAsync({
-        requestedScopes: [
-          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
-          AppleAuthentication.AppleAuthenticationScope.EMAIL,
-        ],
-        nonce: hashedNonce,
-      })
-      if (!credential.identityToken) throw new Error('Apple 인증 토큰을 받지 못했어요.')
-      const { error } = await supabase.auth.signInWithIdToken({
-        provider: 'apple',
-        token: credential.identityToken,
-        nonce: rawNonce,
-      })
-      if (error) throw error
-    } catch (e: unknown) {
-      const err = e as { code?: string; message?: string }
-      if (err?.code !== 'ERR_REQUEST_CANCELED') {
-        Alert.alert('로그인 실패', err?.message ?? '오류가 발생했어요.')
-      }
-    } finally {
-      setLoading(false)
-    }
-  }
-
   const handleGoogleSignIn = async () => {
     try {
       setLoading(true)
+      const redirectTo = makeRedirectUri({ scheme: 'photomap' })
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: 'photomap://',
+          redirectTo,
           skipBrowserRedirect: true,
         },
       })
       if (error || !data.url) throw error ?? new Error('인증 URL을 가져오지 못했어요.')
 
-      const result = await WebBrowser.openAuthSessionAsync(data.url, 'photomap://')
+      const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo)
 
       if (result.type === 'success' && result.url) {
-        const hashPart = result.url.includes('#')
-          ? result.url.split('#')[1]
-          : result.url.split('?')[1] ?? ''
-        const params = new URLSearchParams(hashPart)
-        const accessToken = params.get('access_token')
-        const refreshToken = params.get('refresh_token')
-        if (accessToken && refreshToken) {
-          const { error: sessErr } = await supabase.auth.setSession({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-          })
-          if (sessErr) throw sessErr
-        }
+        await applySessionFromUrl(result.url)
       }
     } catch (e: unknown) {
       const err = e as { message?: string }
@@ -123,10 +136,45 @@ export default function LoginScreen() {
     }
   }
 
+  const performGuestSignIn = async () => {
+    try {
+      setLoading(true)
+      const { error } = await supabase.auth.signInAnonymously()
+      if (error) throw error
+    } catch (e: unknown) {
+      const err = e as { message?: string; code?: string; status?: number }
+      const isAnonymousDisabled =
+        err?.code === 'anonymous_provider_disabled' ||
+        err?.status === 422 ||
+        err?.message?.includes('Anonymous sign-ins are disabled')
+
+      Alert.alert(
+        '게스트 로그인 실패',
+        isAnonymousDisabled
+          ? '현재 서버에서 게스트 로그인이 비활성화되어 있어요.'
+          : err?.message ?? '오류가 발생했어요.'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleGuestSignIn = () => {
+    Alert.alert(
+      '게스트로 시작할까요?',
+      '게스트 데이터는 로그아웃하는 순간 바로 삭제되고, 마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요. 같은 게스트 계정으로 다시 로그인할 수 없어요.',
+      [
+        { text: '취소', style: 'cancel' },
+        { text: '계속', onPress: () => void performGuestSignIn() },
+      ]
+    )
+  }
+
   if (!ready) return null
 
   if (showOnboarding) {
-    const current = SLIDES[slide]
+    const safeSlide = Math.min(Math.max(slide, 0), SLIDES.length - 1)
+    const current = SLIDES[safeSlide] ?? SLIDES[0]
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.slide}>
@@ -168,21 +216,18 @@ export default function LoginScreen() {
       </View>
 
       <View style={styles.authActions}>
-        {Platform.OS === 'ios' && (
-          <AppleAuthentication.AppleAuthenticationButton
-            buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
-            buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
-            cornerRadius={14}
-            style={styles.appleBtn}
-            onPress={handleAppleSignIn}
-          />
-        )}
-
         <Pressable style={[styles.googleBtn, loading && styles.disabledBtn]} onPress={handleGoogleSignIn} disabled={loading}>
           <Text style={styles.googleBtnText}>
             {loading ? '로그인 중…' : 'Google로 계속하기'}
           </Text>
         </Pressable>
+
+        <Pressable style={[styles.guestBtn, loading && styles.disabledBtn]} onPress={handleGuestSignIn} disabled={loading}>
+          <Text style={styles.guestBtnText}>게스트로 둘러보기</Text>
+        </Pressable>
+        <Text style={styles.guestNotice}>
+          게스트 데이터는 로그아웃 즉시 삭제되며, 마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요.
+        </Text>
       </View>
     </SafeAreaView>
   )
@@ -213,7 +258,6 @@ const styles = StyleSheet.create({
   logoSubtitle: { fontSize: 16, color: '#777' },
 
   authActions: { gap: 12, paddingBottom: 8 },
-  appleBtn: { width: '100%', height: 52 },
   googleBtn: {
     width: '100%',
     height: 52,
@@ -226,6 +270,24 @@ const styles = StyleSheet.create({
   },
   disabledBtn: { opacity: 0.6 },
   googleBtnText: { fontSize: 16, fontWeight: '600', color: '#333' },
+  guestBtn: {
+    width: '100%',
+    height: 52,
+    backgroundColor: '#fff',
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#d7dce1',
+  },
+  guestBtnText: { fontSize: 16, fontWeight: '600', color: '#475569' },
+  guestNotice: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#64748b',
+    textAlign: 'center',
+    paddingHorizontal: 6,
+  },
 
   primaryBtn: {
     backgroundColor: '#1a73e8',
