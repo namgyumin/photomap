@@ -1,5 +1,5 @@
 import { decode } from 'base64-arraybuffer'
-import * as FileSystem from 'expo-file-system'
+import { readAsStringAsync } from 'expo-file-system/legacy'
 import * as ImageManipulator from 'expo-image-manipulator'
 import * as ImagePicker from 'expo-image-picker'
 import type { MediaType } from '../types/database'
@@ -69,6 +69,49 @@ function extractExif(asset: ImagePicker.ImagePickerAsset): {
 }
 
 // 사진/영상 1개 선택. 영상은 클라이언트에서 10초 검증.
+function assetToPickedMedia(asset: ImagePicker.ImagePickerAsset): PickedMedia {
+  const isVideo = asset.type === 'video'
+  const durationSeconds =
+    asset.duration != null ? Math.round((asset.duration / 1000) * 10) / 10 : null
+  const exif = extractExif(asset)
+  return {
+    uri: asset.uri,
+    mediaType: isVideo ? 'video' : 'photo',
+    durationSeconds: isVideo ? durationSeconds : null,
+    width: asset.width ?? null,
+    height: asset.height ?? null,
+    capturedAt: exif.capturedAt,
+    latitude: exif.latitude,
+    longitude: exif.longitude,
+  }
+}
+
+export async function pickMediaMultiple(): Promise<PickedMedia[]> {
+  const perm = await ImagePicker.requestMediaLibraryPermissionsAsync()
+  if (!perm.granted) throw new Error('PERMISSION_DENIED')
+
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['images', 'videos'],
+    allowsMultipleSelection: true,
+    quality: 0.8,
+    exif: true,
+  })
+
+  if (result.canceled || !result.assets?.length) return []
+
+  const picked: PickedMedia[] = []
+  for (const asset of result.assets) {
+    const isVideo = asset.type === 'video'
+    if (isVideo) {
+      const secs = asset.duration != null ? Math.round((asset.duration / 1000) * 10) / 10 : null
+      if (secs == null || secs <= 0) throw new Error('video duration unknown')
+      if (secs > MAX_VIDEO_SECONDS) throw new VideoTooLongError(secs)
+    }
+    picked.push(assetToPickedMedia(asset))
+  }
+  return picked
+}
+
 export async function pickMedia(): Promise<PickedMedia | null> {
   const perm = await ImagePicker.requestMediaLibraryPermissionsAsync()
   if (!perm.granted) {
@@ -127,8 +170,8 @@ async function uploadLocalFile(
   uri: string,
   contentType: string
 ): Promise<void> {
-  const base64 = await FileSystem.readAsStringAsync(uri, {
-    encoding: FileSystem.EncodingType.Base64,
+  const base64 = await readAsStringAsync(uri, {
+    encoding: 'base64',
   })
 
   const { error } = await supabase.storage.from(bucket).upload(path, decode(base64), {
@@ -148,6 +191,14 @@ async function createPhotoThumbnail(localUri: string, width: number): Promise<st
   return result.uri
 }
 
+async function sanitizePhotoForUpload(localUri: string): Promise<string> {
+  const result = await ImageManipulator.manipulateAsync(localUri, [], {
+    compress: 0.9,
+    format: ImageManipulator.SaveFormat.JPEG,
+  })
+  return result.uri
+}
+
 // 로컬 URI → Supabase Storage 업로드. 원본 + 사진 썸네일 경로 반환.
 export async function uploadMedia(
   userId: string,
@@ -158,9 +209,10 @@ export async function uploadMedia(
   const now = Date.now()
   const ext = mediaType === 'video' ? 'mp4' : 'jpg'
   const storagePath = `${userId}/${visitId}/original/${now}.${ext}`
-  const mimeType = getMimeType(localUri, mediaType)
+  const sanitizedPhotoUri = mediaType === 'photo' ? await sanitizePhotoForUpload(localUri) : localUri
+  const mimeType = getMimeType(sanitizedPhotoUri, mediaType)
 
-  await uploadLocalFile('visit-photos', storagePath, localUri, mimeType)
+  await uploadLocalFile('visit-photos', storagePath, sanitizedPhotoUri, mimeType)
 
   if (mediaType === 'video') {
     return { storagePath, thumbnail128: null, thumbnail512: null }
@@ -169,8 +221,8 @@ export async function uploadMedia(
   const thumb128Path = `${userId}/${visitId}/thumbs/${now}_128.jpg`
   const thumb512Path = `${userId}/${visitId}/thumbs/${now}_512.jpg`
   const [thumb128Uri, thumb512Uri] = await Promise.all([
-    createPhotoThumbnail(localUri, 128),
-    createPhotoThumbnail(localUri, 512),
+    createPhotoThumbnail(sanitizedPhotoUri, 128),
+    createPhotoThumbnail(sanitizedPhotoUri, 512),
   ])
 
   await Promise.all([

@@ -1,4 +1,5 @@
 import { edgeFunctionUrl, googleMapsApiKey, hasGoogleMapsKey, supabaseAnonKey } from './config'
+import { supabase } from './supabase'
 
 export interface PlaceSearchResult {
   googlePlaceId: string
@@ -7,6 +8,16 @@ export interface PlaceSearchResult {
   latitude: number
   longitude: number
   heroPhotoUrl: string | null
+}
+
+export interface PlaceDetailsResult {
+  id: string
+  displayName?: { text?: string }
+  formattedAddress?: string
+  location?: { latitude: number; longitude: number }
+  regularOpeningHours?: { weekdayDescriptions?: string[] }
+  internationalPhoneNumber?: string
+  websiteUri?: string
 }
 
 interface RawPlace {
@@ -24,26 +35,41 @@ export function buildPhotoUrl(photoName: string, maxWidthPx = 800): string {
 
 export async function searchPlaces(
   query: string,
-  locationBias?: { latitude: number; longitude: number }
+  locationBias?: { latitude: number; longitude: number },
+  sessionToken?: string
 ): Promise<PlaceSearchResult[]> {
   if (!query.trim()) return []
 
   // Prefer Edge Function (keeps API key server-side)
   if (edgeFunctionUrl && supabaseAnonKey) {
     try {
+      const { data: sessionData } = await supabase.auth.getSession()
+      const accessToken = sessionData.session?.access_token
       const res = await fetch(`${edgeFunctionUrl}/places-search`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${supabaseAnonKey}`,
+          apikey: supabaseAnonKey,
+          Authorization: `Bearer ${accessToken ?? supabaseAnonKey}`,
         },
-        body: JSON.stringify({ query, locationBias: locationBias ?? null }),
+        body: JSON.stringify({
+          query,
+          locationBias: locationBias ?? null,
+          sessionToken: sessionToken ?? null,
+        }),
       })
       if (res.ok) {
         return (await res.json()) as PlaceSearchResult[]
       }
-    } catch {
-      // Fall through to direct call
+
+      const bodyText = await res.text().catch(() => '')
+      throw new Error(`EDGE_PLACES_SEARCH_FAILED: ${res.status} ${bodyText}`)
+    } catch (error) {
+      // In production we should not fall back to direct client Google API calls,
+      // because mobile key restrictions can produce misleading Android-blocked errors.
+      if (hasGoogleMapsKey) {
+        throw error instanceof Error ? error : new Error(String(error))
+      }
     }
   }
 
@@ -53,6 +79,9 @@ export async function searchPlaces(
   }
 
   const body: Record<string, unknown> = { textQuery: query, languageCode: 'ko' }
+  if (sessionToken) {
+    body.sessionToken = sessionToken
+  }
   if (locationBias) {
     body.locationBias = {
       circle: {
@@ -91,4 +120,28 @@ export async function searchPlaces(
       longitude: p.location!.longitude,
       heroPhotoUrl: p.photos?.[0]?.name ? buildPhotoUrl(p.photos[0].name) : null,
     }))
+}
+
+export async function fetchPlaceDetails(placeId: string): Promise<PlaceDetailsResult | null> {
+  if (!placeId.trim() || !edgeFunctionUrl || !supabaseAnonKey) return null
+
+  const { data: sessionData } = await supabase.auth.getSession()
+  const accessToken = sessionData.session?.access_token
+  const res = await fetch(`${edgeFunctionUrl}/places-details`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: supabaseAnonKey,
+      Authorization: `Bearer ${accessToken ?? supabaseAnonKey}`,
+    },
+    body: JSON.stringify({ placeId }),
+  })
+
+  if (res.status === 404) return null
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '')
+    throw new Error(`EDGE_PLACES_DETAILS_FAILED: ${res.status} ${bodyText}`)
+  }
+
+  return (await res.json()) as PlaceDetailsResult
 }

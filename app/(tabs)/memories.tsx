@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -11,7 +11,7 @@ import {
   TextInput,
   View,
 } from 'react-native'
-import { useFocusEffect, useRouter } from 'expo-router'
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { SharedImportModal } from '../../src/components/SharedImportModal'
 import { resolveMediaUri } from '../../src/lib/media'
@@ -22,6 +22,8 @@ import { useAuth } from '../../src/hooks/useAuth'
 export default function MemoriesScreen() {
   const { userId, loading: authLoading } = useAuth()
   const router = useRouter()
+  const params = useLocalSearchParams<{ token?: string; autoImport?: string }>()
+  const autoHandledTokenRef = useRef<string | null>(null)
 
   const [items, setItems] = useState<MemoryListItem[]>([])
   const [loading, setLoading] = useState(false)
@@ -48,6 +50,24 @@ export default function MemoriesScreen() {
       void load()
     }, [load])
   )
+
+  useEffect(() => {
+    const sharedToken = typeof params.token === 'string' ? params.token.trim() : ''
+    const shouldAutoImport = params.autoImport === '1'
+    if (!sharedToken) {
+      autoHandledTokenRef.current = null
+      return
+    }
+
+    setToken(sharedToken)
+
+    if (!userId || !shouldAutoImport || autoHandledTokenRef.current === sharedToken) {
+      return
+    }
+
+    autoHandledTokenRef.current = sharedToken
+    setImportVisible(true)
+  }, [params.token, params.autoImport, userId])
 
   const openOnMap = (id: string) => {
     router.push({ pathname: '/', params: { openMemoryId: id } })

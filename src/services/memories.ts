@@ -1,3 +1,4 @@
+import { MAX_VIDEO_SECONDS } from '../lib/media'
 import { supabase } from '../lib/supabase'
 import type {
   ImportMode,
@@ -12,8 +13,6 @@ import type {
   SharedMemory,
   Visibility,
 } from '../types/database'
-
-const MAX_VIDEO_SECONDS = 10
 
 // ============================================================
 // places
@@ -250,8 +249,8 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
     .from('visits')
     .select(
       `id, visited_at, note, amount_spent, hero_media_id,
-       place:places(id, display_name, address, latitude, longitude),
-       media:visit_photos(id, thumbnail_512, storage_path, sort_order)`
+       place:places!visits_place_id_fkey(id, display_name, address, latitude, longitude),
+       media:visit_photos!visit_photos_visit_id_fkey(id, thumbnail_512, storage_path, sort_order)`
     )
     .eq('user_id', userId)
     .order('visited_at', { ascending: false })

@@ -3,6 +3,10 @@
 // Requires GOOGLE_MAPS_API_KEY env var set in Supabase Edge Function secrets.
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { checkRateLimit, getClientIp } from '../_shared/rateLimiter.ts'
+
+const RATE_LIMIT = 20
+const RATE_WINDOW_MS = 60_000
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -12,6 +16,15 @@ const corsHeaders = {
 serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
+  }
+
+  const ip = getClientIp(req)
+  const { allowed, retryAfter } = checkRateLimit(ip, RATE_LIMIT, RATE_WINDOW_MS)
+  if (!allowed) {
+    return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+      status: 429,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) },
+    })
   }
 
   try {
@@ -37,7 +50,7 @@ serve(async (req: Request) => {
       headers: {
         'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
-          'id,displayName,formattedAddress,location,regularOpeningHours,internationalPhoneNumber,websiteUri',
+          'id,displayName,formattedAddress,location,regularOpeningHours,internationalPhoneNumber,websiteUri,photos',
         'Accept-Language': 'ko',
       },
     })
@@ -50,8 +63,30 @@ serve(async (req: Request) => {
       })
     }
 
-    const place = await res.json()
-    return new Response(JSON.stringify(place), {
+    const place = await res.json() as {
+      photos?: Array<{ name: string }>
+      [key: string]: unknown
+    }
+
+    // 첫 번째 photo media URL fetch (서버에서 처리해 API key 노출 방지)
+    let googleHeroPhotoUrl: string | null = null
+    const photoName = place.photos?.[0]?.name
+    if (photoName) {
+      try {
+        const mediaRes = await fetch(
+          `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=800&skipHttpRedirect=true`,
+          { headers: { 'X-Goog-Api-Key': apiKey } }
+        )
+        if (mediaRes.ok) {
+          const mediaJson = await mediaRes.json() as { photoUri?: string }
+          googleHeroPhotoUrl = mediaJson.photoUri ?? null
+        }
+      } catch {
+        // photo fetch 실패해도 기본 정보는 반환
+      }
+    }
+
+    return new Response(JSON.stringify({ ...place, googleHeroPhotoUrl }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   } catch (err) {

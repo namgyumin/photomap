@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">PhotoMap adaptive icon background</title>
+  <rect width="512" height="512" fill="#E9F6F2"/>
+  <path d="M-14 323C60 269 131 289 189 338C242 383 302 378 360 326C402 289 446 283 526 321" fill="none" stroke="#FFFFFF" stroke-width="20" stroke-linecap="round" opacity="0.52"/>
+  <path d="M-22 133C41 105 103 105 162 131C231 161 294 151 352 108C403 70 456 66 532 93" fill="none" stroke="#0E6B6F" stroke-width="14" stroke-linecap="round" opacity="0.14"/>
+  <path d="M-16 416C51 397 107 408 153 451C198 493 251 494 315 432C367 382 435 373 528 416" fill="none" stroke="#FFD166" stroke-width="18" stroke-linecap="round" opacity="0.32"/>
+</svg>

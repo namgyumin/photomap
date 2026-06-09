@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">PhotoMap favicon</title>
+  <rect width="48" height="48" rx="11" fill="#E9F6F2"/>
+  <path d="M11 16C11 14 12 13 14 12L20 11L28 13L36 11C38 11 39 12 39 14V34C39 36 38 37 36 37L28 39L20 36L13 38C11 38 10 37 10 35V17C10 16 10 16 11 16Z" fill="#FAFBF8"/>
+  <path d="M20 12V36M28 14V38" stroke="#B5D9D2" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M15 20C18 18 21 18 24 20C27 21 30 21 34 19" fill="none" stroke="#0E6B6F" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M28 13C23 13 20 17 20 21C20 27 28 34 28 34C28 34 36 27 36 21C36 17 33 13 28 13Z" fill="#FF7A66"/>
+  <circle cx="28" cy="21" r="4.2" fill="#FAFBF8"/>
+  <circle cx="28" cy="21" r="2.4" fill="#21343A"/>
+</svg>

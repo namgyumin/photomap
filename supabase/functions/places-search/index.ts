@@ -3,6 +3,10 @@
 // Requires GOOGLE_MAPS_API_KEY env var set in Supabase Edge Function secrets.
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { checkRateLimit, getClientIp } from '../_shared/rateLimiter.ts'
+
+const RATE_LIMIT = 30
+const RATE_WINDOW_MS = 60_000
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -21,11 +25,21 @@ interface PlaceResult {
   latitude: number
   longitude: number
   heroPhotoUrl: null
+  googlePhotoName: string | null
 }
 
 serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
+  }
+
+  const ip = getClientIp(req)
+  const { allowed, retryAfter } = checkRateLimit(ip, RATE_LIMIT, RATE_WINDOW_MS)
+  if (!allowed) {
+    return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+      status: 429,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) },
+    })
   }
 
   try {
@@ -38,8 +52,9 @@ serve(async (req: Request) => {
     }
 
     const apiKey = Deno.env.get('GOOGLE_MAPS_API_KEY')
-    if (!apiKey) {
-      return new Response(JSON.stringify({ error: 'GOOGLE_MAPS_API_KEY not configured' }), {
+    console.log('[places-search] apiKey exists:', !!apiKey, 'length:', apiKey?.length)
+    if (!apiKey || !apiKey.trim()) {
+      return new Response(JSON.stringify({ error: 'GOOGLE_MAPS_API_KEY not configured or empty' }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
@@ -59,14 +74,14 @@ serve(async (req: Request) => {
       }
     }
 
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    headers.set('X-Goog-Api-Key', apiKey)
+    headers.set('X-Goog-FieldMask', 'places.id,places.displayName,places.formattedAddress,places.location,places.photos')
+
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask':
-          'places.id,places.displayName,places.formattedAddress,places.location',
-      },
+      headers,
       body: JSON.stringify(body),
     })
 
@@ -84,6 +99,7 @@ serve(async (req: Request) => {
         displayName?: { text?: string }
         formattedAddress?: string
         location?: { latitude: number; longitude: number }
+        photos?: Array<{ name: string }>
       }>
     }
 
@@ -96,6 +112,7 @@ serve(async (req: Request) => {
         latitude: p.location!.latitude,
         longitude: p.location!.longitude,
         heroPhotoUrl: null,
+        googlePhotoName: p.photos?.[0]?.name ?? null,
       }))
 
     return new Response(JSON.stringify(places), {

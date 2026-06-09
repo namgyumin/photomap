@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PhotoMap adaptive icon foreground</title>
+  <desc id="desc">Transparent foreground art for Android adaptive icons.</desc>
+  <defs>
+    <linearGradient id="mapFill" x1="104" y1="86" x2="408" y2="412" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.52" stop-color="#E6F6EF"/>
+      <stop offset="1" stop-color="#B8E9F7"/>
+    </linearGradient>
+    <linearGradient id="pinFill" x1="242" y1="142" x2="338" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FF917C"/>
+      <stop offset="1" stop-color="#FF5B47"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="none"/>
+  <path d="M107 153C107 138 117 126 131 122L207 101L300 131L381 109C396 105 411 116 411 132V362C411 377 401 389 387 393L303 416L209 386L130 407C115 411 100 400 100 384V155C100 154 103 153 107 153Z" fill="url(#mapFill)"/>
+  <path d="M209 111V386" stroke="#B5D9D2" stroke-width="10" stroke-linecap="round"/>
+  <path d="M302 133V405" stroke="#B5D9D2" stroke-width="10" stroke-linecap="round"/>
+  <path d="M134 195C160 182 185 181 210 193C240 207 269 207 303 188C332 172 358 169 384 176" fill="none" stroke="#0E6B6F" stroke-width="16" stroke-linecap="round" stroke-opacity="0.78"/>
+  <path d="M130 331C159 307 189 305 220 325C250 344 279 340 307 313C335 286 362 281 389 296" fill="none" stroke="#FFD166" stroke-width="18" stroke-linecap="round"/>
+  <path d="M288 145C243 145 207 181 207 226C207 282 288 358 288 358C288 358 369 282 369 226C369 181 333 145 288 145Z" fill="url(#pinFill)"/>
+  <circle cx="288" cy="225" r="42" fill="#FAFBF8"/>
+  <circle cx="288" cy="225" r="25" fill="#21343A"/>
+  <circle cx="279" cy="216" r="8" fill="#8ED7F4"/>
+</svg>

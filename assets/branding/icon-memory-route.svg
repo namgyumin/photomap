@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Memory route icon</title>
+  <rect width="128" height="128" rx="24" fill="#21343A"/>
+  <path d="M31 82C41 62 52 55 64 61C77 67 83 51 94 40" fill="none" stroke="#FFD166" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="31" cy="82" r="13" fill="#DDF3EA"/>
+  <circle cx="94" cy="40" r="13" fill="#FF7A66"/>
+  <rect x="25" y="25" width="36" height="29" rx="8" fill="#FAFBF8"/>
+  <circle cx="43" cy="39" r="8" fill="#0E6B6F"/>
+  <path d="M29 50L38 43L45 49L51 44L58 50" fill="none" stroke="#8ED7F4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

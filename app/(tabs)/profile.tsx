@@ -6,17 +6,30 @@ import { supabase } from '../../src/lib/supabase'
 export default function ProfileScreen() {
   const { session, userId } = useAuth()
   const user = session?.user
+  const isGuest = Boolean(user?.is_anonymous)
 
   const handleLogout = () => {
-    Alert.alert('로그아웃', '로그아웃하시겠어요?', [
+    const message = isGuest
+      ? '게스트 계정은 로그아웃하는 순간 데이터가 바로 삭제돼요. 로그인하지 않은 상태로 30일이 지나도 자동 삭제될 수 있어요. 정말 로그아웃할까요?'
+      : '로그아웃하시겠어요?'
+
+    Alert.alert('로그아웃', message, [
       { text: '취소', style: 'cancel' },
       {
         text: '로그아웃',
         style: 'destructive',
-        onPress: () => {
-          supabase.auth.signOut().catch((err) => {
+        onPress: async () => {
+          try {
+            if (isGuest) {
+              const { error } = await supabase.rpc('delete_current_guest_account')
+              if (error) throw error
+              await supabase.auth.signOut({ scope: 'local' })
+            } else {
+              await supabase.auth.signOut()
+            }
+          } catch (err) {
             Alert.alert('오류', (err as Error).message)
-          })
+          }
         },
       },
     ])
@@ -34,6 +47,7 @@ export default function ProfileScreen() {
     (user.user_metadata?.full_name as string | undefined) ?? user.email ?? userId ?? '사용자'
   const email = user.email ?? ''
   const initial = displayName.charAt(0).toUpperCase()
+  const accountLabel = isGuest ? '게스트 계정 · 로그아웃 시 데이터 즉시 삭제' : '일반 계정'
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -42,6 +56,7 @@ export default function ProfileScreen() {
           <Text style={styles.avatarInitial}>{initial}</Text>
         </View>
         <Text style={styles.name}>{displayName}</Text>
+        <Text style={styles.accountLabel}>{accountLabel}</Text>
         {email ? <Text style={styles.email}>{email}</Text> : null}
       </View>
 
@@ -73,6 +88,7 @@ const styles = StyleSheet.create({
   },
   avatarInitial: { fontSize: 32, fontWeight: '700', color: '#fff' },
   name: { fontSize: 22, fontWeight: '700', color: '#111', marginBottom: 6 },
+  accountLabel: { fontSize: 13, color: '#1a73e8', marginBottom: 6, fontWeight: '600' },
   email: { fontSize: 14, color: '#888' },
   logoutBtn: {
     marginTop: 'auto',

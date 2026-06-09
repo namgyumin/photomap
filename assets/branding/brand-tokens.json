@@ -1,0 +1,24 @@
+{
+  "name": "PhotoMap",
+  "colors": {
+    "ink": "#21343A",
+    "deepTeal": "#0E6B6F",
+    "mapMint": "#DDF3EA",
+    "sky": "#8ED7F4",
+    "photoCoral": "#FF7A66",
+    "sun": "#FFD166",
+    "paper": "#FAFBF8"
+  },
+  "radii": {
+    "appIconCorner": 216,
+    "markCorner": 24
+  },
+  "usage": {
+    "primaryLogo": "assets/branding/logo-horizontal.svg",
+    "appIcon": "assets/branding/app-icon.png",
+    "androidAdaptiveForeground": "assets/branding/adaptive-icon-foreground.png",
+    "androidAdaptiveBackground": "assets/branding/adaptive-icon-background.png",
+    "androidMonochrome": "assets/branding/adaptive-icon-monochrome.png",
+    "favicon": "assets/branding/favicon.png"
+  }
+}

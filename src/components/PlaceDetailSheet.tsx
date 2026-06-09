@@ -1,44 +1,39 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Image,
   Modal,
+  PanResponder,
   Pressable,
   ScrollView,
   Share,
   StyleSheet,
-  Switch,
   Text,
-  TextInput,
   View,
 } from 'react-native'
-import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps'
 import type { PlaceSearchResult } from '../lib/googlePlaces'
-import { MAX_VIDEO_SECONDS, pickMedia, resolveMediaUri, uploadMedia, VideoTooLongError } from '../lib/media'
+import { fetchPlaceDetails } from '../lib/googlePlaces'
+import { pickMediaMultiple, resolveMediaUri, uploadMedia, VideoTooLongError, MAX_VIDEO_SECONDS } from '../lib/media'
 import {
   addMediaToVisit,
   createOrGetPlace,
-  createShareLink,
   createVisitMemory,
   deleteMedia,
-  deleteVisitMemory,
   getMemoryDetail,
   setHeroMedia,
   updateMediaLocation,
   updateVisitMemoryFields,
 } from '../services/memories'
-import type { Media, MemoryDetail } from '../types/database'
+import type { Media, MemoryDetail, Visibility } from '../types/database'
 
 interface Props {
   visible: boolean
   onClose: () => void
   userId: string | null
-  // 검색에서 선택한 (아직 저장 안 했을 수 있는) 장소
   searchPlace?: PlaceSearchResult | null
-  // 기존 메모리 열기
   memoryId?: string | null
-  // 신규 저장 완료 시 (지도 마커 추가용)
   onSaved?: (memoryId: string, place: PlaceSearchResult) => void
   onChanged?: () => void
 }
@@ -46,6 +41,8 @@ interface Props {
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10)
 }
+
+const UNSUPPORTED_MSG = '우리는 사진 저장 앱입니다. 이 기능은 지원하지 않아요!'
 
 export function PlaceDetailSheet({
   visible,
@@ -60,12 +57,54 @@ export function PlaceDetailSheet({
   const [detail, setDetail] = useState<MemoryDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [isDirty, setIsDirty] = useState(false)
+  const [activeTab, setActiveTab] = useState(0)
+  const [hoursExpanded, setHoursExpanded] = useState(false)
+  const [sheetExpanded, setSheetExpanded] = useState(false)
+  const [isEditing, setIsEditing] = useState(false)
+  const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null)
+  const [editLoading, setEditLoading] = useState(false)
+  const [photoLayoutMode, setPhotoLayoutMode] = useState<'auto' | 'vertical' | 'horizontal'>('auto')
+  const dragStartPos = useRef<{ x: number; y: number } | null>(null)
+  const sheetY = useRef(new Animated.Value(0)).current
 
-  // form
+  const sheetRef = useRef(null)
+  const sheetHeight = useRef(new Animated.Value(0)).current
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: (evt) => evt.nativeEvent.locationY < 60,
+        onMoveShouldSetPanResponder: (_, gestureState) => {
+          return Math.abs(gestureState.dy) > 5
+        },
+        onPanResponderMove: (_, gestureState) => {
+          const newHeight = Math.max(0, -gestureState.dy * 2)
+          sheetHeight.setValue(newHeight)
+        },
+        onPanResponderRelease: (_, gestureState) => {
+          if (gestureState.dy > 80) {
+            Animated.timing(sheetHeight, { toValue: 0, duration: 200, useNativeDriver: false }).start()
+            if (sheetExpanded) {
+              setSheetExpanded(false)
+            } else {
+              onClose()
+            }
+          } else if (gestureState.dy < -80) {
+            Animated.timing(sheetHeight, { toValue: 200, duration: 200, useNativeDriver: false }).start()
+            setSheetExpanded(true)
+          } else {
+            Animated.timing(sheetHeight, { toValue: 0, duration: 150, useNativeDriver: false }).start()
+          }
+        },
+      }),
+    [onClose, sheetExpanded, sheetHeight]
+  )
+
   const [visitedAt, setVisitedAt] = useState(todayIso())
   const [note, setNote] = useState('')
-  const [amount, setAmount] = useState('')
   const [isSaved, setIsSaved] = useState(true)
+  const [visibility, setVisibility] = useState<Visibility>('private')
 
   const load = useCallback(async (id: string) => {
     setLoading(true)
@@ -74,8 +113,8 @@ export function PlaceDetailSheet({
       setDetail(d)
       setVisitedAt(d.memory.visited_at?.slice(0, 10) || todayIso())
       setNote(d.memory.note ?? '')
-      setAmount(d.memory.amount_spent != null ? String(d.memory.amount_spent) : '')
       setIsSaved(d.memory.is_saved)
+      setVisibility(d.memory.visibility)
     } catch (e) {
       Alert.alert('불러오기 실패', String((e as Error).message))
     } finally {
@@ -89,47 +128,186 @@ export function PlaceDetailSheet({
       setCurrentId(memoryId)
       void load(memoryId)
     } else {
-      // 신규 (검색 장소)
       setCurrentId(null)
       setDetail(null)
       setVisitedAt(todayIso())
       setNote('')
-      setAmount('')
       setIsSaved(true)
+      setVisibility('private')
     }
+    setActiveTab(0)
+    setHoursExpanded(false)
   }, [visible, memoryId, load])
 
   const placeName = detail?.place?.display_name ?? searchPlace?.name ?? '장소'
   const placeAddress = detail?.place?.address ?? searchPlace?.address ?? null
+  const media = detail?.media ?? []
 
-  // hero: 저장된 대표 미디어 > 검색 장소 사진
-  const heroMedia =
-    detail?.media.find((m) => m.id === detail.memory.hero_media_id) ??
-    detail?.media[0] ??
-    null
-  const heroUri = heroMedia
-    ? resolveMediaUri(heroMedia.thumbnail_512 ?? heroMedia.storage_path)
-    : searchPlace?.heroPhotoUrl ?? null
+  const selectedMediaIndex = media.findIndex(m => m.id === selectedMediaId)
+  const canGoNext = selectedMediaIndex < media.length - 1
+  const canGoPrev = selectedMediaIndex > 0
 
-  const requireAuth = (): boolean => {
-    if (!userId) {
-      Alert.alert('로그인 필요', '저장하려면 먼저 로그인해야 해요.')
-      return false
+  const goToNextPhoto = () => {
+    if (canGoNext) {
+      setSelectedMediaId(media[selectedMediaIndex + 1]?.id ?? null)
     }
-    return true
+  }
+
+  const goToPrevPhoto = () => {
+    if (canGoPrev) {
+      setSelectedMediaId(media[selectedMediaIndex - 1]?.id ?? null)
+    }
+  }
+
+  const handleEditToggle = async () => {
+    setEditLoading(true)
+    setTimeout(() => {
+      setIsEditing(!isEditing)
+      setEditLoading(false)
+    }, 100)
+  }
+
+  const renderPhotoLayout = () => {
+    const count = media.length
+    if (count === 0) return null
+    if (count === 1) {
+      return (
+        <View style={styles.photoLayoutSingle}>
+          {media.map((m) => {
+            const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
+            const isSelected = m.id === selectedMediaId
+            return uri ? (
+              <Pressable
+                key={m.id}
+                style={[styles.photoLayoutSingleItem, isSelected && styles.photoSelected]}
+                onLongPress={() => setSelectedMediaId(m.id)}
+              >
+                <Image source={{ uri }} style={styles.photoImage} />
+                {isSelected && (
+                  <View style={styles.photoNavOverlay}>
+                    <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
+                      <Text style={styles.photoNavText}>‹</Text>
+                    </Pressable>
+                    <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
+                      <Text style={styles.photoNavText}>›</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </Pressable>
+            ) : null
+          })}
+        </View>
+      )
+    }
+    if (count === 2) {
+      const layout = count === 2 ? 'vertical' : 'horizontal'
+      return (
+        <ScrollView
+          horizontal={layout === 'horizontal'}
+          showsHorizontalScrollIndicator={layout === 'horizontal'}
+          style={layout === 'vertical' ? styles.photoLayoutDouble : styles.photoLayoutDoubleH}
+          scrollEnabled={layout === 'horizontal'}
+        >
+          <View style={layout === 'vertical' ? {} : styles.photoLayoutDoubleHContainer}>
+            {media.map((m) => {
+              const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
+              const isSelected = m.id === selectedMediaId
+              return uri ? (
+                <Pressable
+                  key={m.id}
+                  style={[
+                    layout === 'vertical' ? styles.photoLayoutDoubleItem : styles.photoLayoutDoubleHItem,
+                    isSelected && styles.photoSelected,
+                  ]}
+                  onLongPress={() => setSelectedMediaId(m.id)}
+                >
+                  <Image source={{ uri }} style={styles.photoImage} />
+                  {isSelected && (
+                    <View style={styles.photoNavOverlay}>
+                      <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
+                        <Text style={styles.photoNavText}>‹</Text>
+                      </Pressable>
+                      <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
+                        <Text style={styles.photoNavText}>›</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </Pressable>
+              ) : null
+            })}
+          </View>
+        </ScrollView>
+      )
+    }
+    if (count >= 3) {
+      const isTopSelected = media[0]?.id === selectedMediaId
+      return (
+        <View style={styles.photoLayoutTriple}>
+          <Pressable
+            style={[styles.photoLayoutTripleTop, isTopSelected && styles.photoSelected]}
+            onLongPress={() => setSelectedMediaId(media[0]?.id)}
+          >
+            {resolveMediaUri(media[0]?.thumbnail_512 ?? media[0]?.storage_path) && (
+              <Image
+                source={{ uri: resolveMediaUri(media[0]?.thumbnail_512 ?? media[0]?.storage_path) as string }}
+                style={styles.photoImage}
+              />
+            )}
+            {isTopSelected && (
+              <View style={styles.photoNavOverlay}>
+                <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
+                  <Text style={styles.photoNavText}>‹</Text>
+                </Pressable>
+                <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
+                  <Text style={styles.photoNavText}>›</Text>
+                </Pressable>
+              </View>
+            )}
+          </Pressable>
+          <View style={styles.photoLayoutTripleBottom}>
+            {media.slice(1, 3).map((m) => {
+              const isSelected = m.id === selectedMediaId
+              return (
+                <Pressable
+                  key={m.id}
+                  style={[styles.photoLayoutTripleBottomItem, isSelected && styles.photoSelected]}
+                  onLongPress={() => setSelectedMediaId(m.id)}
+                >
+                  {resolveMediaUri(m.thumbnail_512 ?? m.storage_path) && (
+                    <Image source={{ uri: resolveMediaUri(m.thumbnail_512 ?? m.storage_path) as string }} style={styles.photoImage} />
+                  )}
+                  {isSelected && (
+                    <View style={styles.photoNavOverlay}>
+                      <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
+                        <Text style={styles.photoNavText}>‹</Text>
+                      </Pressable>
+                      <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
+                        <Text style={styles.photoNavText}>›</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </Pressable>
+              )
+            })}
+          </View>
+        </View>
+      )
+    }
   }
 
   const handleSave = async () => {
-    if (!requireAuth()) return
+    if (!userId) {
+      Alert.alert('로그인 필요', '저장하려면 먼저 로그인해야 해요.')
+      return
+    }
     setSaving(true)
     try {
-      const amountNum = amount.trim() ? Number(amount) : null
       if (currentId) {
         await updateVisitMemoryFields(currentId, {
           visitedAt,
           note: note || null,
-          amountSpent: Number.isNaN(amountNum as number) ? null : amountNum,
-          isSaved,
+          visibility,
+          isSaved: !isSaved,
         })
         await load(currentId)
         onChanged?.()
@@ -146,47 +324,53 @@ export function PlaceDetailSheet({
           placeId: place.id,
           visitedAt,
           note: note || null,
-          amountSpent: Number.isNaN(amountNum as number) ? null : amountNum,
-          isSaved,
+          visibility,
+          isSaved: !isSaved,
         })
         setCurrentId(memory.id)
         await load(memory.id)
         onSaved?.(memory.id, searchPlace)
         onChanged?.()
-        Alert.alert('저장됨', '내가 갔던 곳에 추가했어요. 이제 사진을 추가할 수 있어요.')
+        Alert.alert('저장됨', '내가 갔던 곳에 추가했어요.')
       }
     } catch (e) {
       Alert.alert('저장 실패', String((e as Error).message))
     } finally {
       setSaving(false)
+      setIsDirty(false)
     }
   }
 
   const handleAddMedia = async () => {
-    if (!requireAuth()) return
-    if (!currentId) {
-      Alert.alert('먼저 저장하기', '사진/영상을 추가하기 전에 장소를 먼저 저장해주세요.')
+    if (!userId) {
+      Alert.alert('로그인 필요', '사진/영상을 추가하려면 먼저 로그인해주세요.')
       return
     }
+    if (!currentId) return
     try {
-      const picked = await pickMedia()
-      if (!picked) return
-
-      const uploaded = await uploadMedia(userId!, currentId, picked.uri, picked.mediaType)
-
-      await addMediaToVisit({
-        visitId: currentId,
-        storagePath: uploaded.storagePath,
-        mediaType: picked.mediaType,
-        durationSeconds: picked.durationSeconds,
-        thumbnail128: uploaded.thumbnail128,
-        thumbnail512: uploaded.thumbnail512,
-        width: picked.width,
-        height: picked.height,
-        capturedAt: picked.capturedAt,
-        latitude: picked.latitude,
-        longitude: picked.longitude,
-      })
+      const pickedList = await pickMediaMultiple()
+      if (!pickedList.length) return
+      for (const picked of pickedList) {
+        const isDuplicate = media.some(m => m.storage_path === picked.uri)
+        if (isDuplicate) {
+          Alert.alert('이미 추가됨', '이미 추가된 사진입니다.')
+          continue
+        }
+        const uploaded = await uploadMedia(userId, currentId, picked.uri, picked.mediaType)
+        await addMediaToVisit({
+          visitId: currentId,
+          storagePath: uploaded.storagePath,
+          mediaType: picked.mediaType,
+          durationSeconds: picked.durationSeconds,
+          thumbnail128: uploaded.thumbnail128,
+          thumbnail512: uploaded.thumbnail512,
+          width: picked.width,
+          height: picked.height,
+          capturedAt: picked.capturedAt,
+          latitude: picked.latitude,
+          longitude: picked.longitude,
+        })
+      }
       await load(currentId)
       onChanged?.()
     } catch (e) {
@@ -200,352 +384,756 @@ export function PlaceDetailSheet({
     }
   }
 
-  const handleSetHero = async (media: Media) => {
-    if (!currentId) return
-    try {
-      await setHeroMedia(currentId, media.id)
-      await load(currentId)
-      onChanged?.()
-    } catch (e) {
-      Alert.alert('대표 사진 변경 실패', String((e as Error).message))
-    }
+  const handleUnsupported = (featureName: string) => {
+    Alert.alert(featureName, UNSUPPORTED_MSG)
   }
 
-  const handleUsePlaceLocation = async (media: Media) => {
-    const lat = detail?.place?.latitude
-    const lng = detail?.place?.longitude
-    if (lat == null || lng == null) {
-      Alert.alert('위치 없음', '장소 좌표가 없어요.')
-      return
-    }
-    try {
-      await updateMediaLocation(media.id, lat, lng)
-      await load(currentId!)
-      onChanged?.()
-    } catch (e) {
-      Alert.alert('위치 저장 실패', String((e as Error).message))
-    }
-  }
-
-  const handleShare = async () => {
-    if (!currentId) {
-      Alert.alert('먼저 저장하기', '공유하려면 먼저 저장해주세요.')
-      return
-    }
-    try {
-      const link = await createShareLink({ visitId: currentId })
-      await Share.share({
-        message: `photomap 기록 공유: ${placeName}\n토큰: ${link.share_token}`,
-      })
-    } catch (e) {
-      Alert.alert('공유 실패', String((e as Error).message))
-    }
-  }
-
-  const handleDeleteMedia = async (mediaItem: Media) => {
-    Alert.alert('미디어 삭제', '이 사진/영상을 삭제할까요?', [
-      { text: '취소', style: 'cancel' },
-      {
-        text: '삭제',
-        style: 'destructive',
-        onPress: () => {
-          if (!currentId) return
-          void deleteMedia(mediaItem)
-            .then(() => load(currentId))
-            .then(() => onChanged?.())
-            .catch((e) => Alert.alert('삭제 실패', String((e as Error).message)))
-        },
-      },
-    ])
-  }
-
-  const handleDeleteVisit = async () => {
-    if (!currentId) return
-    Alert.alert('기록 삭제', '이 장소 기록과 연결된 미디어를 삭제할까요?', [
-      { text: '취소', style: 'cancel' },
-      {
-        text: '삭제',
-        style: 'destructive',
-        onPress: () => {
-          void deleteVisitMemory(currentId)
-            .then(() => {
-              onChanged?.()
-              onClose()
-            })
-            .catch((e) => Alert.alert('삭제 실패', String((e as Error).message)))
-        },
-      },
-    ])
-  }
-
-  const media = detail?.media ?? []
-  const placeLat = detail?.place?.latitude ?? searchPlace?.latitude ?? null
-  const placeLng = detail?.place?.longitude ?? searchPlace?.longitude ?? null
+  const tabs = ['개요', '메뉴', '리뷰', '사진', '업데이트', '정보']
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <View style={styles.backdrop}>
-        <Pressable style={styles.backdropTop} onPress={onClose} />
-        <View style={styles.sheet}>
-          <View style={styles.handle} />
-          {loading ? (
-            <View style={styles.center}>
-              <ActivityIndicator />
-            </View>
-          ) : (
-            <ScrollView showsVerticalScrollIndicator>
-              {/* hero */}
-              {heroUri ? (
-                <Image source={{ uri: heroUri }} style={styles.hero} />
-              ) : (
-                <View style={[styles.hero, styles.heroEmpty]}>
-                  <Text style={styles.heroEmptyText}>대표 사진 없음</Text>
-                </View>
-              )}
-
-              {/* name */}
-              <Text style={styles.name}>{placeName}</Text>
-
-              {/* 필수 필드 */}
-              <View style={styles.field}>
-                <Text style={styles.label}>위치</Text>
-                <Text style={styles.value}>{placeAddress ?? '주소 정보 없음'}</Text>
-              </View>
-
-              {placeLat != null && placeLng != null ? (
-                <View style={styles.field}>
-                  <Text style={styles.label}>작은 지도</Text>
-                  <MapView
-                    provider={PROVIDER_GOOGLE}
-                    style={styles.miniMap}
-                    scrollEnabled={false}
-                    zoomEnabled={false}
-                    pitchEnabled={false}
-                    rotateEnabled={false}
-                    initialRegion={{
-                      latitude: placeLat,
-                      longitude: placeLng,
-                      latitudeDelta: 0.008,
-                      longitudeDelta: 0.008,
-                    }}
-                  >
-                    <Marker coordinate={{ latitude: placeLat, longitude: placeLng }} />
-                  </MapView>
-                </View>
-              ) : null}
-
-              {detail ? (
-                <View style={styles.timelineBox}>
-                  <Text style={styles.label}>내 방문 기록</Text>
-                  <Text style={styles.timelineText}>방문일 {visitedAt}</Text>
-                  <Text style={styles.timelineText}>사진/영상 {media.length}개</Text>
-                </View>
-              ) : null}
-
-              <View style={styles.fieldRow}>
-                <Text style={styles.label}>저장</Text>
-                <Switch value={isSaved} onValueChange={setIsSaved} />
-              </View>
-
-              <View style={styles.field}>
-                <Text style={styles.label}>방문일</Text>
-                <TextInput
-                  style={styles.input}
-                  value={visitedAt}
-                  onChangeText={setVisitedAt}
-                  placeholder="YYYY-MM-DD"
-                />
-              </View>
-
-              <View style={styles.field}>
-                <Text style={styles.label}>메모</Text>
-                <TextInput
-                  style={[styles.input, styles.inputMulti]}
-                  value={note}
-                  onChangeText={setNote}
-                  placeholder="메모를 남겨보세요"
-                  multiline
-                />
-              </View>
-
-              <View style={styles.field}>
-                <Text style={styles.label}>쓴 금액</Text>
-                <TextInput
-                  style={styles.input}
-                  value={amount}
-                  onChangeText={setAmount}
-                  placeholder="0"
-                  keyboardType="numeric"
-                />
-              </View>
-
-              <View style={styles.actionsRow}>
-                <Pressable style={[styles.actionBtn, styles.primary]} onPress={handleSave}>
-                  <Text style={styles.primaryText}>{saving ? '저장 중…' : '저장'}</Text>
-                </Pressable>
-                <Pressable style={[styles.actionBtn, styles.ghost]} onPress={handleShare}>
-                  <Text style={styles.ghostText}>공유</Text>
-                </Pressable>
-              </View>
-
-              {currentId ? (
-                <Pressable style={styles.deleteVisitBtn} onPress={handleDeleteVisit}>
-                  <Text style={styles.deleteVisitText}>기록 삭제</Text>
-                </Pressable>
-              ) : null}
-
-              {/* 사진/영상 리스트 */}
-              <View style={styles.mediaHeader}>
-                <Text style={styles.sectionTitle}>사진 / 영상 ({media.length})</Text>
-                <Pressable onPress={handleAddMedia}>
-                  <Text style={styles.addLink}>+ 추가</Text>
-                </Pressable>
-              </View>
-
-              {media.length === 0 ? (
-                <Text style={styles.empty}>
-                  {currentId
-                    ? '아직 사진/영상이 없어요. + 추가로 넣어보세요.'
-                    : '저장하면 사진/영상을 추가할 수 있어요.'}
-                </Text>
-              ) : (
-                media.map((m) => {
-                  const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
-                  const isHero = m.id === detail?.memory.hero_media_id
-                  return (
-                    <View key={m.id} style={styles.mediaItem}>
-                      {uri ? (
-                        <Image source={{ uri }} style={styles.mediaThumb} />
-                      ) : (
-                        <View style={[styles.mediaThumb, styles.heroEmpty]} />
-                      )}
-                      <View style={styles.mediaMeta}>
-                        <Text style={styles.mediaType}>
-                          {m.media_type === 'video'
-                            ? `영상 ${m.duration_seconds ?? '?'}s`
-                            : '사진'}
-                          {m.imported_from_user_id ? ' · 가져옴' : ''}
-                        </Text>
-                        {m.latitude != null && m.longitude != null ? (
-                          <Text style={styles.mediaCoords}>
-                            {`위치: ${m.latitude.toFixed(5)}, ${m.longitude.toFixed(5)}`}
-                          </Text>
-                        ) : (
-                          <Text style={styles.mediaCoords}>위치 없음</Text>
-                        )}
-                        <Pressable
-                          onPress={() => handleSetHero(m)}
-                          disabled={isHero}
-                        >
-                          <Text style={[styles.heroBtn, isHero && styles.heroBtnActive]}>
-                            {isHero ? '★ 대표 사진' : '대표로 설정'}
-                          </Text>
-                        </Pressable>
-                        {m.captured_at ? (
-                          <Text style={styles.mediaCoords}>{`촬영: ${m.captured_at.slice(0, 10)}`}</Text>
-                        ) : null}
-                        <Pressable onPress={() => handleUsePlaceLocation(m)}>
-                          <Text style={styles.locationBtn}>장소 위치 사용</Text>
-                        </Pressable>
-                        <Pressable onPress={() => handleDeleteMedia(m)}>
-                          <Text style={styles.deleteMediaBtn}>삭제</Text>
-                        </Pressable>
-                      </View>
-                    </View>
-                  )
-                })
-              )}
-
-              <View style={{ height: 40 }} />
-            </ScrollView>
-          )}
+      <Pressable style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }} onPress={onClose} />
+      <Animated.View
+        style={[
+          styles.sheet,
+          sheetExpanded && styles.sheetExpanded,
+          {
+            maxHeight: sheetHeight.interpolate({
+              inputRange: [0, 200],
+              outputRange: ['88%', '92%'],
+            }),
+          },
+        ]}
+        ref={sheetRef}
+        {...panResponder.panHandlers}
+      >
+        {/* Drag Handle */}
+        <View style={styles.dragHandleContainer}>
+          <View style={styles.dragHandle} />
         </View>
-      </View>
+
+        {loading ? (
+          <View style={styles.center}>
+            <ActivityIndicator />
+          </View>
+        ) : (
+          <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
+            {/* Header */}
+            <View style={styles.headerContainer}>
+              <View style={styles.headerLeft}>
+                {/* Place Name */}
+                <Text style={styles.placeName} numberOfLines={2}>
+                  {placeName}
+                </Text>
+
+                {/* Subtitle */}
+                <Text style={styles.subtitle} numberOfLines={1}>
+                  {placeAddress || '주소 정보 없음'}
+                </Text>
+
+                {/* Rating Row */}
+                <View style={styles.ratingRow}>
+                  <Text style={styles.ratingNumber}>4.1</Text>
+                  {[...Array(5)].map((_, i) => (
+                    <Text key={i} style={styles.starIcon}>
+                      ⭐
+                    </Text>
+                  ))}
+                  <Text style={styles.reviewCount}>(2,094)</Text>
+                  <Text style={styles.separator}>·</Text>
+                  <View style={styles.transitContainer}>
+                    <TransitIcon size={14} color="#70757A" />
+                    <Text style={styles.transitText}>도보 16시간 12분</Text>
+                  </View>
+                </View>
+
+                {/* Category */}
+                <Text style={styles.category}>일본라면 전문식당 · ¥1,000~2,000</Text>
+
+                {/* Status */}
+                <Text style={[styles.statusText, styles.statusOpen]}>
+                  영업 중 · 오후 11:00에 영업 종료
+                </Text>
+              </View>
+
+              {/* Header Icon Buttons */}
+              <View style={styles.headerIconsContainer}>
+                <Pressable
+                  style={[styles.headerIconBtn, isSaved && styles.headerIconBtnActive]}
+                  onPress={handleSave}
+                >
+                  <Image
+                    source={isSaved ? require('../../assets/icons/bookmark-check.png') : require('../../assets/icons/bookmark.png')}
+                    style={styles.headerIcon}
+                  />
+                </Pressable>
+
+                <Pressable style={styles.headerIconBtn} onPress={() => handleUnsupported('공유')}>
+                  <Image source={require('../../assets/icons/share.png')} style={styles.headerIcon} />
+                </Pressable>
+
+                <Pressable style={styles.headerIconBtn} onPress={onClose}>
+                  <Image source={require('../../assets/icons/close.png')} style={styles.headerIcon} />
+                </Pressable>
+              </View>
+            </View>
+
+            {/* Action Buttons - Horizontal Scroll */}
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.actionButtonsScroll}
+              contentContainerStyle={styles.actionButtonsContainer}
+            >
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnPrimary]}
+                onPress={() => handleUnsupported('경로')}
+              >
+                <Image source={require('../../assets/icons/direction.png')} style={styles.actionIcon} />
+                <Text style={styles.actionBtnTextPrimary}>경로</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnSecondary]}
+                onPress={() => handleUnsupported('시작')}
+              >
+                <Image source={require('../../assets/icons/navigate.png')} style={styles.actionIcon} />
+                <Text style={styles.actionBtnText}>시작</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnSecondary]}
+                onPress={() => handleUnsupported('통화')}
+              >
+                <Image source={require('../../assets/icons/phone.png')} style={styles.actionIcon} />
+                <Text style={styles.actionBtnText}>통화</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnSecondary]}
+                onPress={handleSave}
+              >
+                <Image
+                  source={isSaved ? require('../../assets/icons/bookmark-check.png') : require('../../assets/icons/bookmark.png')}
+                  style={styles.actionIcon}
+                />
+                <Text style={styles.actionBtnText}>{isSaved ? '저장됨' : '저장'}</Text>
+              </Pressable>
+            </ScrollView>
+
+            {/* Photo Section */}
+            {!sheetExpanded && media.length > 0 && renderPhotoLayout()}
+
+            {sheetExpanded ? (
+              <View style={styles.photoGridContainer}>
+                <View style={styles.photoGrid}>
+                  {media.length > 0 ? (
+                    <>
+                      {media.map((m) => {
+                        const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
+                        return uri ? (
+                          <View key={m.id} style={styles.photoGridItem}>
+                            <Image source={{ uri }} style={styles.photoImage} />
+                          </View>
+                        ) : null
+                      })}
+                      {[...Array(Math.max(1, 3 - media.length))].map((_, i) => (
+                        <Pressable
+                          key={`extra-${i}`}
+                          style={styles.photoGridItem}
+                          onPress={handleAddMedia}
+                        >
+                          <View style={styles.photoAddPlaceholder}>
+                            <Text style={styles.photoAddIcon}>📷</Text>
+                            <Text style={styles.photoAddLabel}>추가</Text>
+                          </View>
+                        </Pressable>
+                      ))}
+                    </>
+                  ) : (
+                    <>
+                      {[...Array(6)].map((_, i) => (
+                        <Pressable
+                          key={`new-${i}`}
+                          style={styles.photoGridItem}
+                          onPress={handleAddMedia}
+                        >
+                          <View style={styles.photoAddPlaceholder}>
+                            <Text style={styles.photoAddIcon}>📷</Text>
+                            <Text style={styles.photoAddLabel}>추가</Text>
+                          </View>
+                        </Pressable>
+                      ))}
+                    </>
+                  )}
+                </View>
+              </View>
+            ) : (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={styles.photoStripScroll}
+                contentContainerStyle={styles.photoStripContainer}
+              >
+                {media.length > 0 ? (
+                  <>
+                    {media.map((m) => {
+                      const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
+                      return uri ? (
+                        <View key={m.id} style={styles.photoItem}>
+                          <Image source={{ uri }} style={styles.photoImage} />
+                        </View>
+                      ) : null
+                    })}
+                    {[...Array(Math.max(1, 3 - media.length))].map((_, i) => (
+                      <Pressable
+                        key={`extra-${i}`}
+                        style={styles.photoItem}
+                        onPress={handleAddMedia}
+                      >
+                        <View style={styles.photoAddPlaceholder}>
+                          <Text style={styles.photoAddIcon}>📷</Text>
+                          <Text style={styles.photoAddLabel}>사진 드래그</Text>
+                          <Text style={styles.photoAddSubLabel}>or browse files</Text>
+                        </View>
+                      </Pressable>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    {[...Array(3)].map((_, i) => (
+                      <Pressable
+                        key={`new-${i}`}
+                        style={styles.photoItem}
+                        onPress={handleAddMedia}
+                      >
+                        <View style={styles.photoAddPlaceholder}>
+                          <Text style={styles.photoAddIcon}>📷</Text>
+                          <Text style={styles.photoAddLabel}>사진 드래그</Text>
+                          <Text style={styles.photoAddSubLabel}>or browse files</Text>
+                        </View>
+                      </Pressable>
+                    ))}
+                  </>
+                )}
+              </ScrollView>
+            )}
+
+            {/* Tab Bar */}
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.tabBarScroll}
+              contentContainerStyle={styles.tabBarContainer}
+            >
+              {tabs.map((tab, idx) => (
+                <Pressable
+                  key={tab}
+                  style={styles.tabItem}
+                  onPress={() => setActiveTab(idx)}
+                >
+                  <Text style={[styles.tabText, activeTab === idx && styles.tabTextActive]}>
+                    {tab}
+                  </Text>
+                  {activeTab === idx && <View style={styles.tabUnderline} />}
+                </Pressable>
+              ))}
+            </ScrollView>
+
+            {/* Business Hours Row */}
+            <Pressable
+              style={styles.infoRow}
+              onPress={() => setHoursExpanded(!hoursExpanded)}
+            >
+              <View style={styles.infoIconContainer}>
+                <Image source={require('../../assets/icons/clock.png')} style={styles.infoIcon} />
+              </View>
+              <Text style={styles.infoLabel}>영업시간</Text>
+              <View style={styles.infoChevronContainer}>
+                <Image
+                  source={hoursExpanded ? require('../../assets/icons/chevron-down.png') : require('../../assets/icons/chevron-right.png')}
+                  style={styles.infoChevronIcon}
+                />
+              </View>
+            </Pressable>
+
+            {hoursExpanded && (
+              <View style={styles.hoursContent}>
+                <Text style={styles.hoursText}>월~일: 09:00 - 23:00</Text>
+              </View>
+            )}
+
+            {/* Edit Button */}
+            <View style={styles.editButtonContainer}>
+              <Pressable
+                style={[styles.editButton, isEditing && styles.editButtonActive, editLoading && styles.editButtonLoading]}
+                onPress={handleEditToggle}
+                disabled={editLoading}
+              >
+                {editLoading ? (
+                  <ActivityIndicator size="small" color={isEditing ? '#fff' : '#666'} />
+                ) : (
+                  <Text style={[styles.editButtonText, isEditing && { color: '#fff' }]}>
+                    {isEditing ? '수정완료' : '수정'}
+                  </Text>
+                )}
+              </Pressable>
+            </View>
+
+            <View style={{ height: 20 }} />
+          </ScrollView>
+        )}
+      </Animated.View>
     </Modal>
   )
 }
 
+// Transit icon placeholder function
+const TransitIcon: React.FC<{ size: number; color: string }> = ({ size, color }) => (
+  <View style={{ width: size, height: size }}>
+    {/* Simple transport icon placeholder */}
+    <Text style={{ fontSize: size * 0.8, color }}>🚗</Text>
+  </View>
+)
+
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.3)' },
-  backdropTop: { height: 60 },
   sheet: {
-    flex: 1,
     backgroundColor: '#fff',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    paddingHorizontal: 16,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    maxHeight: '88%',
+    flex: 1,
+  },
+  sheetExpanded: {
+    maxHeight: '92%',
+  },
+  dragHandleContainer: {
+    alignItems: 'center',
     paddingTop: 8,
+    paddingBottom: 3,
   },
-  handle: {
-    alignSelf: 'center',
-    width: 40,
+  dragHandle: {
+    width: 36,
     height: 4,
+    backgroundColor: '#C7C7CC',
     borderRadius: 2,
-    backgroundColor: '#ddd',
-    marginBottom: 8,
   },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  hero: { width: '100%', height: 220, borderRadius: 12, backgroundColor: '#eee' },
-  heroEmpty: { alignItems: 'center', justifyContent: 'center' },
-  heroEmptyText: { color: '#999' },
-  name: { fontSize: 22, fontWeight: '700', marginTop: 14, marginBottom: 8 },
-  field: { marginBottom: 12 },
-  fieldRow: {
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // HEADER
+  headerContainer: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 2,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E8EAED',
+  },
+  headerLeft: {
+    flex: 1,
+    minWidth: 0,
+  },
+  placeName: {
+    fontSize: 21,
+    fontWeight: '700',
+    color: '#1a1a1a',
+    letterSpacing: -0.4,
+    lineHeight: 25,
+  },
+  subtitle: {
+    fontSize: 12.5,
+    color: '#70757A',
+    lineHeight: 17,
+    marginTop: 2,
+  },
+  ratingRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    gap: 2,
+    marginTop: 4,
+    flexWrap: 'wrap',
+  },
+  ratingNumber: {
+    fontWeight: '700',
+    color: '#1a1a1a',
+    fontSize: 12,
+  },
+  starIcon: {
+    fontSize: 11,
+  },
+  reviewCount: {
+    fontSize: 12,
+    color: '#70757A',
+  },
+  separator: {
+    fontSize: 12,
+    color: '#70757A',
+    marginHorizontal: 2,
+  },
+  transitContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    marginLeft: 4,
+  },
+  transitText: {
+    fontSize: 12,
+    color: '#70757A',
+  },
+  category: {
+    fontSize: 12.5,
+    color: '#70757A',
+    marginTop: 3,
+  },
+  statusText: {
+    fontSize: 12.5,
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  statusOpen: {
+    color: '#137333',
+  },
+  statusClosed: {
+    color: '#C62828',
+  },
+  statusClosing: {
+    color: '#EA8600',
+  },
+
+  // Header Icon Buttons
+  headerIconsContainer: {
+    flexDirection: 'column',
+    gap: 6,
+  },
+  headerIconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    borderWidth: 1.5,
+    borderColor: '#E8EAED',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+  },
+  headerIconBtnActive: {
+    backgroundColor: '#1C7B6C',
+    borderColor: '#1C7B6C',
+  },
+  headerIcon: {
+    width: 17,
+    height: 17,
+    resizeMode: 'contain',
+  },
+
+  // ACTION BUTTONS
+  actionButtonsScroll: {
+    paddingHorizontal: 16,
+  },
+  actionButtonsContainer: {
+    paddingVertical: 12,
+    gap: 8,
+    paddingBottom: 10,
+  },
+  actionBtn: {
+    height: 50,
+    borderRadius: 25,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+  },
+  actionBtnPrimary: {
+    backgroundColor: '#1C7B6C',
+  },
+  actionBtnSecondary: {
+    backgroundColor: '#D8EEE9',
+  },
+  actionBtnTextPrimary: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  actionBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#1C7B6C',
+  },
+  actionIcon: {
+    width: 18,
+    height: 18,
+    resizeMode: 'contain',
+  },
+
+  // PHOTO STRIP
+  photoStripScroll: {
     marginBottom: 12,
   },
-  label: { fontSize: 13, color: '#888', marginBottom: 4 },
-  value: { fontSize: 15, color: '#222' },
-  miniMap: { width: '100%', height: 130, borderRadius: 12, overflow: 'hidden' },
-  timelineBox: {
+  photoStripContainer: {
+    height: 250,
+    paddingHorizontal: 16,
+    gap: 3,
+  },
+  photoItem: {
+    width: 160,
+    height: 250,
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  photoImage: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'cover',
+  },
+  photoAddPlaceholder: {
+    width: '100%',
+    height: '100%',
+    backgroundColor: '#F0F0EE',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 4,
     borderWidth: 1,
-    borderColor: '#edf0f3',
+    borderColor: '#ccc',
+    borderStyle: 'dashed',
+  },
+  photoAddIcon: {
+    fontSize: 32,
+    marginBottom: 4,
+  },
+  photoAddLabel: {
+    fontSize: 12,
+    color: '#999',
+    fontWeight: '500',
+  },
+  photoAddSubLabel: {
+    fontSize: 11,
+    color: '#bbb',
+    marginTop: 2,
+  },
+
+  // PHOTO GRID (Expanded)
+  photoGridContainer: {
+    flex: 1,
     backgroundColor: '#fafafa',
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 12,
+  },
+  photoGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    justifyContent: 'flex-start',
+  },
+  photoGridItem: {
+    width: '31%',
+    aspectRatio: 1,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
+  },
+
+  // PHOTO LAYOUTS (Collapsed state)
+  photoLayoutSingle: {
+    height: 300,
+    marginHorizontal: 16,
+    marginBottom: 12,
     borderRadius: 12,
-    padding: 12,
+    overflow: 'hidden',
+  },
+  photoLayoutSingleItem: {
+    width: '100%',
+    height: '100%',
+  },
+  photoLayoutDouble: {
+    height: 300,
+    marginHorizontal: 16,
     marginBottom: 12,
   },
-  timelineText: { fontSize: 13, color: '#555', marginTop: 2 },
-  input: {
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 15,
+  photoLayoutDoubleItem: {
+    height: 150,
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginBottom: 6,
   },
-  inputMulti: { minHeight: 70, textAlignVertical: 'top' },
-  actionsRow: { flexDirection: 'row', gap: 10, marginTop: 4, marginBottom: 20 },
-  actionBtn: { flex: 1, borderRadius: 10, paddingVertical: 13, alignItems: 'center' },
-  primary: { backgroundColor: '#1a73e8' },
-  primaryText: { color: '#fff', fontWeight: '600', fontSize: 15 },
-  ghost: { backgroundColor: '#f1f3f4' },
-  ghostText: { color: '#444', fontWeight: '600', fontSize: 15 },
-  mediaHeader: {
+  photoLayoutDoubleH: {
+    height: 250,
+    marginHorizontal: 16,
+    marginBottom: 12,
+  },
+  photoLayoutDoubleHContainer: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  photoLayoutDoubleHItem: {
+    width: 250,
+    height: 250,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  photoLayoutTriple: {
+    marginHorizontal: 16,
+    marginBottom: 12,
+    gap: 6,
+  },
+  photoLayoutTripleTop: {
+    height: 200,
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginBottom: 6,
+  },
+  photoLayoutTripleBottom: {
+    flexDirection: 'row',
+    height: 140,
+    gap: 6,
+  },
+  photoLayoutTripleBottomItem: {
+    flex: 1,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+
+  // PHOTO SELECTION & NAVIGATION
+  photoSelected: {
+    borderWidth: 3,
+    borderColor: '#1C7B6C',
+  },
+  photoNavOverlay: {
+    ...StyleSheet.absoluteFill,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    borderRadius: 12,
   },
-  sectionTitle: { fontSize: 16, fontWeight: '700' },
-  addLink: { color: '#1a73e8', fontWeight: '600', fontSize: 15 },
-  empty: { color: '#999', paddingVertical: 16 },
-  mediaItem: {
+  photoNavBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  photoNavText: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#1a1a1a',
+  },
+
+  // TAB BAR
+  tabBarScroll: {
+    marginTop: 4,
+  },
+  tabBarContainer: {
+    borderBottomWidth: 1.5,
+    borderBottomColor: '#E8EAED',
+  },
+  tabItem: {
+    paddingVertical: 11,
+    paddingHorizontal: 13,
+    position: 'relative',
+  },
+  tabText: {
+    fontSize: 13.5,
+    fontWeight: '500',
+    color: '#70757A',
+    letterSpacing: -0.2,
+  },
+  tabTextActive: {
+    color: '#1C7B6C',
+    fontWeight: '700',
+  },
+  tabUnderline: {
+    position: 'absolute',
+    bottom: -1.5,
+    left: 0,
+    right: 0,
+    height: 2.5,
+    backgroundColor: '#1C7B6C',
+    borderTopLeftRadius: 2,
+    borderTopRightRadius: 2,
+  },
+
+  // BUSINESS HOURS
+  infoRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    marginBottom: 12,
+    gap: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F3F4',
   },
-  mediaThumb: { width: 80, height: 80, borderRadius: 8, backgroundColor: '#eee' },
-  mediaMeta: { flex: 1 },
-  mediaType: { fontSize: 14, color: '#333', marginBottom: 6 },
-  heroBtn: { color: '#1a73e8', fontSize: 13, fontWeight: '600' },
-  heroBtnActive: { color: '#f5a623' },
-  mediaCoords: { fontSize: 11, color: '#999', marginBottom: 4 },
-  locationBtn: { color: '#34a853', fontSize: 13, fontWeight: '600', marginTop: 4 },
-  deleteMediaBtn: { color: '#d93025', fontSize: 13, fontWeight: '600', marginTop: 4 },
-  deleteVisitBtn: { alignSelf: 'center', marginTop: -8, marginBottom: 20, paddingVertical: 8 },
-  deleteVisitText: { color: '#d93025', fontSize: 13, fontWeight: '600' },
+  infoIconContainer: {
+    width: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  infoLabel: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#1a1a1a',
+  },
+  infoChevronContainer: {
+    width: 17,
+    height: 17,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  infoIcon: {
+    width: 20,
+    height: 20,
+    resizeMode: 'contain',
+  },
+  infoChevronIcon: {
+    width: 17,
+    height: 17,
+    resizeMode: 'contain',
+  },
+  hoursContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#fafafa',
+  },
+  hoursText: {
+    fontSize: 13,
+    color: '#666',
+    lineHeight: 20,
+  },
+
+  // EDIT BUTTON
+  editButtonContainer: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#E8EAED',
+  },
+  editButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    backgroundColor: '#F0F0EE',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editButtonActive: {
+    backgroundColor: '#1C7B6C',
+  },
+  editButtonLoading: {
+    opacity: 0.7,
+  },
+  editButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#666',
+  },
+  editButtonActiveText: {
+    color: '#fff',
+  },
 })
