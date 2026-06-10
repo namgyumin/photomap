@@ -15,9 +15,13 @@ export interface PlaceDetailsResult {
   displayName?: { text?: string }
   formattedAddress?: string
   location?: { latitude: number; longitude: number }
-  regularOpeningHours?: { weekdayDescriptions?: string[] }
+  regularOpeningHours?: { openNow?: boolean; weekdayDescriptions?: string[] }
   internationalPhoneNumber?: string
   websiteUri?: string
+  rating?: number
+  userRatingCount?: number
+  primaryTypeDisplayName?: { text?: string }
+  googleHeroPhotoUrl?: string | null
 }
 
 interface RawPlace {
@@ -59,7 +63,18 @@ export async function searchPlaces(
         }),
       })
       if (res.ok) {
-        return (await res.json()) as PlaceSearchResult[]
+        const items = (await res.json()) as Array<
+          PlaceSearchResult & { googlePhotoName?: string | null }
+        >
+        // Edge Function이 photo URL을 해석하지 못한 항목은 클라이언트 키로 보완
+        return items.map((item) => ({
+          ...item,
+          heroPhotoUrl:
+            item.heroPhotoUrl ??
+            (item.googlePhotoName && hasGoogleMapsKey
+              ? buildPhotoUrl(item.googlePhotoName, 512)
+              : null),
+        }))
       }
 
       const bodyText = await res.text().catch(() => '')
@@ -78,10 +93,9 @@ export async function searchPlaces(
     throw new Error('NO_GOOGLE_MAPS_KEY')
   }
 
+  // NOTE: places:searchText 는 sessionToken 필드를 지원하지 않음 (Autocomplete 전용).
+  // body에 넣으면 400 INVALID_ARGUMENT 발생.
   const body: Record<string, unknown> = { textQuery: query, languageCode: 'ko' }
-  if (sessionToken) {
-    body.sessionToken = sessionToken
-  }
   if (locationBias) {
     body.locationBias = {
       circle: {

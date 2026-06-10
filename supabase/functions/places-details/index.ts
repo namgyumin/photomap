@@ -50,7 +50,7 @@ serve(async (req: Request) => {
       headers: {
         'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
-          'id,displayName,formattedAddress,location,regularOpeningHours,internationalPhoneNumber,websiteUri,photos',
+          'id,displayName,formattedAddress,location,regularOpeningHours,internationalPhoneNumber,websiteUri,photos,rating,userRatingCount,primaryTypeDisplayName',
         'Accept-Language': 'ko',
       },
     })

@@ -16,7 +16,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router'
 import * as Location from 'expo-location'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { PlaceDetailSheet } from '../../src/components/PlaceDetailSheet'
-import { hasGoogleMapsKey } from '../../src/lib/config'
+import { edgeFunctionUrl, hasGoogleMapsKey } from '../../src/lib/config'
 import { searchPlaces, type PlaceSearchResult } from '../../src/lib/googlePlaces'
 import { loadMapMarkers, type MapMarker } from '../../src/services/memories'
 import { useAuth } from '../../src/hooks/useAuth'
@@ -152,7 +152,8 @@ export default function MapScreen() {
   const doSearch = useCallback(
     async (q: string) => {
       if (!q.trim()) return
-      if (!hasGoogleMapsKey) {
+      // Edge Function 경로는 클라이언트 키가 필요 없음 — 둘 다 없을 때만 차단
+      if (!hasGoogleMapsKey && !edgeFunctionUrl) {
         Alert.alert(
           '검색 비활성화',
           'Google Maps API 키가 설정되지 않았어요. GOOGLE_MAPS_API_KEY 를 설정해주세요.'

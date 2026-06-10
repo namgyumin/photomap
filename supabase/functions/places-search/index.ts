@@ -24,8 +24,25 @@ interface PlaceResult {
   address: string | null
   latitude: number
   longitude: number
-  heroPhotoUrl: null
+  heroPhotoUrl: string | null
   googlePhotoName: string | null
+}
+
+// 사진 media URL 해석 (skipHttpRedirect → photoUri는 key 없이 접근 가능한 googleusercontent URL)
+const MAX_PHOTO_RESOLVE = 8
+
+async function resolvePhotoUri(photoName: string, apiKey: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=512&skipHttpRedirect=true`,
+      { headers: { 'X-Goog-Api-Key': apiKey } }
+    )
+    if (!res.ok) return null
+    const json = (await res.json()) as { photoUri?: string }
+    return json.photoUri ?? null
+  } catch {
+    return null
+  }
 }
 
 serve(async (req: Request) => {
@@ -111,9 +128,18 @@ serve(async (req: Request) => {
         address: p.formattedAddress ?? null,
         latitude: p.location!.latitude,
         longitude: p.location!.longitude,
-        heroPhotoUrl: null,
+        heroPhotoUrl: null as string | null,
         googlePhotoName: p.photos?.[0]?.name ?? null,
       }))
+
+    // 상위 결과의 hero photo URL을 서버에서 해석 (API key 클라이언트 노출 방지)
+    await Promise.all(
+      places.slice(0, MAX_PHOTO_RESOLVE).map(async (place) => {
+        if (place.googlePhotoName) {
+          place.heroPhotoUrl = await resolvePhotoUri(place.googlePhotoName, apiKey)
+        }
+      })
+    )
 
     return new Response(JSON.stringify(places), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },

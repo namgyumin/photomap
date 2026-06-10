@@ -4,16 +4,20 @@ import {
   Alert,
   Animated,
   Image,
+  LayoutAnimation,
+  Linking,
   Modal,
   PanResponder,
+  Platform,
   Pressable,
   ScrollView,
   Share,
   StyleSheet,
   Text,
+  UIManager,
   View,
 } from 'react-native'
-import type { PlaceSearchResult } from '../lib/googlePlaces'
+import type { PlaceDetailsResult, PlaceSearchResult } from '../lib/googlePlaces'
 import { fetchPlaceDetails } from '../lib/googlePlaces'
 import { pickMediaMultiple, resolveMediaUri, uploadMedia, VideoTooLongError, MAX_VIDEO_SECONDS } from '../lib/media'
 import {
@@ -44,6 +48,17 @@ function todayIso(): string {
 
 const UNSUPPORTED_MSG = '우리는 사진 저장 앱입니다. 이 기능은 지원하지 않아요!'
 
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true)
+}
+
+const EXPANDED_DRAG = -200 // dragY 기준 확장 상태 안착 지점
+const SPRING_CONFIG = { tension: 60, friction: 11, useNativeDriver: false as const }
+
+function animateLayout() {
+  LayoutAnimation.configureNext(LayoutAnimation.create(220, 'easeInEaseOut', 'opacity'))
+}
+
 export function PlaceDetailSheet({
   visible,
   onClose,
@@ -64,41 +79,59 @@ export function PlaceDetailSheet({
   const [isEditing, setIsEditing] = useState(false)
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null)
   const [editLoading, setEditLoading] = useState(false)
-  const [photoLayoutMode, setPhotoLayoutMode] = useState<'auto' | 'vertical' | 'horizontal'>('auto')
-  const dragStartPos = useRef<{ x: number; y: number } | null>(null)
-  const sheetY = useRef(new Animated.Value(0)).current
+  const [placeDetails, setPlaceDetails] = useState<PlaceDetailsResult | null>(null)
 
   const sheetRef = useRef(null)
-  const sheetHeight = useRef(new Animated.Value(0)).current
+  // 단일 드래그 값: 음수 = 위로(시트 확장), 양수 = 아래로(시트 내려감/닫기)
+  const dragY = useRef(new Animated.Value(0)).current
+  const dragBase = useRef(0)
 
   const panResponder = useMemo(
     () =>
       PanResponder.create({
         onStartShouldSetPanResponder: (evt) => evt.nativeEvent.locationY < 60,
-        onMoveShouldSetPanResponder: (_, gestureState) => {
-          return Math.abs(gestureState.dy) > 5
+        onMoveShouldSetPanResponder: (evt, gestureState) =>
+          evt.nativeEvent.locationY < 60 && Math.abs(gestureState.dy) > 5,
+        onPanResponderGrant: () => {
+          dragBase.current = sheetExpanded ? EXPANDED_DRAG : 0
         },
         onPanResponderMove: (_, gestureState) => {
-          const newHeight = Math.max(0, -gestureState.dy * 2)
-          sheetHeight.setValue(newHeight)
+          // 위로는 저항감 있게(0.5배), 아래로는 손가락을 그대로 따라오게
+          const delta = gestureState.dy < 0 ? gestureState.dy * 0.5 : gestureState.dy
+          dragY.setValue(Math.max(EXPANDED_DRAG, dragBase.current + delta))
         },
         onPanResponderRelease: (_, gestureState) => {
-          if (gestureState.dy > 80) {
-            Animated.timing(sheetHeight, { toValue: 0, duration: 200, useNativeDriver: false }).start()
+          const { dy, vy } = gestureState
+          const flickDown = vy > 0.8
+          const flickUp = vy < -0.8
+          if ((dy > 80 || flickDown) && !flickUp) {
             if (sheetExpanded) {
+              animateLayout()
               setSheetExpanded(false)
+              Animated.spring(dragY, { toValue: 0, velocity: vy, ...SPRING_CONFIG }).start()
             } else {
-              onClose()
+              // 아래로 밀어내며 자연스럽게 닫기
+              Animated.timing(dragY, { toValue: 600, duration: 220, useNativeDriver: false }).start(
+                () => {
+                  onClose()
+                  dragY.setValue(0)
+                }
+              )
             }
-          } else if (gestureState.dy < -80) {
-            Animated.timing(sheetHeight, { toValue: 200, duration: 200, useNativeDriver: false }).start()
+          } else if (dy < -80 || flickUp) {
+            animateLayout()
             setSheetExpanded(true)
+            Animated.spring(dragY, { toValue: EXPANDED_DRAG, velocity: vy, ...SPRING_CONFIG }).start()
           } else {
-            Animated.timing(sheetHeight, { toValue: 0, duration: 150, useNativeDriver: false }).start()
+            Animated.spring(dragY, {
+              toValue: sheetExpanded ? EXPANDED_DRAG : 0,
+              velocity: vy,
+              ...SPRING_CONFIG,
+            }).start()
           }
         },
       }),
-    [onClose, sheetExpanded, sheetHeight]
+    [onClose, sheetExpanded, dragY]
   )
 
   const [visitedAt, setVisitedAt] = useState(todayIso())
@@ -137,7 +170,29 @@ export function PlaceDetailSheet({
     }
     setActiveTab(0)
     setHoursExpanded(false)
-  }, [visible, memoryId, load])
+    setSheetExpanded(false)
+    setIsEditing(false)
+    setSelectedMediaId(null)
+    dragY.setValue(0)
+  }, [visible, memoryId, load, dragY])
+
+  // Google Places 상세 정보 로드 (실패해도 기본 정보는 표시)
+  const googlePlaceId = searchPlace?.googlePlaceId ?? detail?.place?.google_place_id ?? null
+  useEffect(() => {
+    if (!visible || !googlePlaceId) {
+      setPlaceDetails(null)
+      return
+    }
+    let cancelled = false
+    fetchPlaceDetails(googlePlaceId)
+      .then((d) => {
+        if (!cancelled) setPlaceDetails(d)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [visible, googlePlaceId])
 
   const placeName = detail?.place?.display_name ?? searchPlace?.name ?? '장소'
   const placeAddress = detail?.place?.address ?? searchPlace?.address ?? null
@@ -146,6 +201,11 @@ export function PlaceDetailSheet({
   const selectedMediaIndex = media.findIndex(m => m.id === selectedMediaId)
   const canGoNext = selectedMediaIndex < media.length - 1
   const canGoPrev = selectedMediaIndex > 0
+
+  const selectMedia = (id: string | null) => {
+    animateLayout()
+    setSelectedMediaId(id)
+  }
 
   const goToNextPhoto = () => {
     if (canGoNext) {
@@ -159,12 +219,22 @@ export function PlaceDetailSheet({
     }
   }
 
-  const handleEditToggle = async () => {
+  const handleEditToggle = () => {
     setEditLoading(true)
     setTimeout(() => {
+      animateLayout()
       setIsEditing(!isEditing)
       setEditLoading(false)
     }, 100)
+  }
+
+  const handleCall = () => {
+    const phone = placeDetails?.internationalPhoneNumber
+    if (phone) {
+      Linking.openURL(`tel:${phone.replace(/[^+\d]/g, '')}`).catch(() => {})
+    } else {
+      handleUnsupported('통화')
+    }
   }
 
   const renderPhotoLayout = () => {
@@ -180,7 +250,7 @@ export function PlaceDetailSheet({
               <Pressable
                 key={m.id}
                 style={[styles.photoLayoutSingleItem, isSelected && styles.photoSelected]}
-                onLongPress={() => setSelectedMediaId(m.id)}
+                onLongPress={() => selectMedia(m.id)}
               >
                 <Image source={{ uri }} style={styles.photoImage} />
                 {isSelected && (
@@ -219,7 +289,7 @@ export function PlaceDetailSheet({
                     layout === 'vertical' ? styles.photoLayoutDoubleItem : styles.photoLayoutDoubleHItem,
                     isSelected && styles.photoSelected,
                   ]}
-                  onLongPress={() => setSelectedMediaId(m.id)}
+                  onLongPress={() => selectMedia(m.id)}
                 >
                   <Image source={{ uri }} style={styles.photoImage} />
                   {isSelected && (
@@ -245,7 +315,7 @@ export function PlaceDetailSheet({
         <View style={styles.photoLayoutTriple}>
           <Pressable
             style={[styles.photoLayoutTripleTop, isTopSelected && styles.photoSelected]}
-            onLongPress={() => setSelectedMediaId(media[0]?.id)}
+            onLongPress={() => selectMedia(media[0]?.id ?? null)}
           >
             {resolveMediaUri(media[0]?.thumbnail_512 ?? media[0]?.storage_path) && (
               <Image
@@ -271,7 +341,7 @@ export function PlaceDetailSheet({
                 <Pressable
                   key={m.id}
                   style={[styles.photoLayoutTripleBottomItem, isSelected && styles.photoSelected]}
-                  onLongPress={() => setSelectedMediaId(m.id)}
+                  onLongPress={() => selectMedia(m.id)}
                 >
                   {resolveMediaUri(m.thumbnail_512 ?? m.storage_path) && (
                     <Image source={{ uri: resolveMediaUri(m.thumbnail_512 ?? m.storage_path) as string }} style={styles.photoImage} />
@@ -396,12 +466,21 @@ export function PlaceDetailSheet({
       <Animated.View
         style={[
           styles.sheet,
-          sheetExpanded && styles.sheetExpanded,
           {
-            maxHeight: sheetHeight.interpolate({
-              inputRange: [0, 200],
-              outputRange: ['88%', '92%'],
+            maxHeight: dragY.interpolate({
+              inputRange: [EXPANDED_DRAG, 0],
+              outputRange: ['92%', '88%'],
+              extrapolate: 'clamp',
             }),
+            transform: [
+              {
+                translateY: dragY.interpolate({
+                  inputRange: [0, 600],
+                  outputRange: [0, 600],
+                  extrapolateLeft: 'clamp',
+                }),
+              },
+            ],
           },
         ]}
         ref={sheetRef}
@@ -432,28 +511,38 @@ export function PlaceDetailSheet({
                 </Text>
 
                 {/* Rating Row */}
-                <View style={styles.ratingRow}>
-                  <Text style={styles.ratingNumber}>4.1</Text>
-                  {[...Array(5)].map((_, i) => (
-                    <Text key={i} style={styles.starIcon}>
-                      ⭐
-                    </Text>
-                  ))}
-                  <Text style={styles.reviewCount}>(2,094)</Text>
-                  <Text style={styles.separator}>·</Text>
-                  <View style={styles.transitContainer}>
-                    <TransitIcon size={14} color="#70757A" />
-                    <Text style={styles.transitText}>도보 16시간 12분</Text>
+                {placeDetails?.rating != null && (
+                  <View style={styles.ratingRow}>
+                    <Text style={styles.ratingNumber}>{placeDetails.rating.toFixed(1)}</Text>
+                    {[...Array(Math.round(placeDetails.rating))].map((_, i) => (
+                      <Text key={i} style={styles.starIcon}>
+                        ⭐
+                      </Text>
+                    ))}
+                    {placeDetails.userRatingCount != null && (
+                      <Text style={styles.reviewCount}>
+                        ({placeDetails.userRatingCount.toLocaleString()})
+                      </Text>
+                    )}
                   </View>
-                </View>
+                )}
 
                 {/* Category */}
-                <Text style={styles.category}>일본라면 전문식당 · ¥1,000~2,000</Text>
+                {placeDetails?.primaryTypeDisplayName?.text ? (
+                  <Text style={styles.category}>{placeDetails.primaryTypeDisplayName.text}</Text>
+                ) : null}
 
                 {/* Status */}
-                <Text style={[styles.statusText, styles.statusOpen]}>
-                  영업 중 · 오후 11:00에 영업 종료
-                </Text>
+                {placeDetails?.regularOpeningHours?.openNow != null && (
+                  <Text
+                    style={[
+                      styles.statusText,
+                      placeDetails.regularOpeningHours.openNow ? styles.statusOpen : styles.statusClosed,
+                    ]}
+                  >
+                    {placeDetails.regularOpeningHours.openNow ? '영업 중' : '영업 종료'}
+                  </Text>
+                )}
               </View>
 
               {/* Header Icon Buttons */}
@@ -501,7 +590,7 @@ export function PlaceDetailSheet({
               </Pressable>
               <Pressable
                 style={[styles.actionBtn, styles.actionBtnSecondary]}
-                onPress={() => handleUnsupported('통화')}
+                onPress={handleCall}
               >
                 <Image source={require('../../assets/icons/phone.png')} style={styles.actionIcon} />
                 <Text style={styles.actionBtnText}>통화</Text>
@@ -640,7 +729,10 @@ export function PlaceDetailSheet({
             {/* Business Hours Row */}
             <Pressable
               style={styles.infoRow}
-              onPress={() => setHoursExpanded(!hoursExpanded)}
+              onPress={() => {
+                animateLayout()
+                setHoursExpanded(!hoursExpanded)
+              }}
             >
               <View style={styles.infoIconContainer}>
                 <Image source={require('../../assets/icons/clock.png')} style={styles.infoIcon} />
@@ -656,7 +748,11 @@ export function PlaceDetailSheet({
 
             {hoursExpanded && (
               <View style={styles.hoursContent}>
-                <Text style={styles.hoursText}>월~일: 09:00 - 23:00</Text>
+                <Text style={styles.hoursText}>
+                  {placeDetails?.regularOpeningHours?.weekdayDescriptions?.length
+                    ? placeDetails.regularOpeningHours.weekdayDescriptions.join('\n')
+                    : '영업시간 정보 없음'}
+                </Text>
               </View>
             )}
 
@@ -684,14 +780,6 @@ export function PlaceDetailSheet({
     </Modal>
   )
 }
-
-// Transit icon placeholder function
-const TransitIcon: React.FC<{ size: number; color: string }> = ({ size, color }) => (
-  <View style={{ width: size, height: size }}>
-    {/* Simple transport icon placeholder */}
-    <Text style={{ fontSize: size * 0.8, color }}>🚗</Text>
-  </View>
-)
 
 const styles = StyleSheet.create({
   sheet: {
