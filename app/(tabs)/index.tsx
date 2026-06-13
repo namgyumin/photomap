@@ -31,6 +31,8 @@ const SEOUL: Region = {
 interface SavedMarker {
   memoryId: string
   place: PlaceSearchResult
+  isSaved: boolean
+  listColor: string | null
 }
 
 interface Cluster {
@@ -80,13 +82,39 @@ function markerFromMapMarker(m: MapMarker): SavedMarker {
       longitude: m.longitude,
       heroPhotoUrl: m.heroThumbnail,
     },
+    isSaved: m.isSaved,
+    listColor: m.listColor,
   }
+}
+
+// 사진 있으면 사진 마커, 없으면 저장 목록 색상 점 마커
+function SavedMarkerContent({ marker }: { marker: SavedMarker }) {
+  const thumb = marker.place.heroPhotoUrl
+  if (thumb) {
+    return (
+      <View style={[styles.photoMarker, marker.listColor ? { borderColor: marker.listColor } : null]}>
+        <Image source={{ uri: thumb }} style={styles.photoMarkerImage} />
+      </View>
+    )
+  }
+  return (
+    <View style={[styles.savedDot, { backgroundColor: marker.listColor ?? '#1C7B6C' }]}>
+      <View style={styles.savedDotInner} />
+    </View>
+  )
 }
 
 export default function MapScreen() {
   const { userId } = useAuth()
   const router = useRouter()
-  const params = useLocalSearchParams<{ openMemoryId?: string }>()
+  const params = useLocalSearchParams<{
+    openMemoryId?: string
+    placeId?: string
+    placeName?: string
+    placeAddress?: string
+    focusLat?: string
+    focusLng?: string
+  }>()
   const mapRef = useRef<MapView>(null)
 
   const [query, setQuery] = useState('')
@@ -109,6 +137,20 @@ export default function MapScreen() {
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sessionTokenRef = useRef<string | null>(null)
+  // focus 파라미터로 진입했으면 현재위치 자동 센터링이 덮어쓰지 않게 막음
+  const focusActiveRef = useRef(false)
+
+  // 마운트 시점에 focus 파라미터가 있으면 그 좌표에서 바로 시작 (SEOUL 깜빡임 방지)
+  const initialRegionRef = useRef<Region>(
+    (() => {
+      const lat = Number(params.focusLat)
+      const lng = Number(params.focusLng)
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        return { latitude: lat, longitude: lng, latitudeDelta: 0.01, longitudeDelta: 0.01 }
+      }
+      return SEOUL
+    })()
+  )
 
   // 위치 권한 요청 + 현재 위치 획득
   useEffect(() => {
@@ -121,6 +163,7 @@ export default function MapScreen() {
         if (!pos) return
         const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude }
         setUserLocation(loc)
+        if (focusActiveRef.current) return
         mapRef.current?.animateToRegion({
           ...loc,
           latitudeDelta: 0.05,
@@ -139,15 +182,42 @@ export default function MapScreen() {
       .catch(() => setMarkersError(true))
   }, [userId])
 
-  // 리스트 탭에서 넘어온 메모리 열기
+  // 기록/목록에서 넘어온 진입: 장소 검색에서 그 장소를 선택한 것과 동일하게 처리
   useEffect(() => {
-    if (params.openMemoryId) {
-      setSheetMemoryId(params.openMemoryId)
+    const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v)
+    const memoryId = one(params.openMemoryId)
+    if (!memoryId || memoryId === 'undefined') return
+
+    const placeId = one(params.placeId)
+    const lat = Number(one(params.focusLat))
+    const lng = Number(one(params.focusLng))
+
+    if (placeId && Number.isFinite(lat) && Number.isFinite(lng)) {
+      const place: PlaceSearchResult = {
+        googlePlaceId: placeId,
+        name: one(params.placeName) || '장소',
+        address: one(params.placeAddress) || null,
+        latitude: lat,
+        longitude: lng,
+        heroPhotoUrl: null,
+      }
+      focusActiveRef.current = true
+      setResults([])
+      setSheetMemoryId(memoryId)
+      setSheetPlace(place)
+      setSheetOpen(true)
+      const region = { latitude: lat, longitude: lng, latitudeDelta: 0.01, longitudeDelta: 0.01 }
+      // 탭 전환 직후 한 번은 무시될 수 있어 시점 분산 (같은 좌표 중복 무해)
+      for (const delay of [80, 500, 1200]) {
+        setTimeout(() => mapRef.current?.animateToRegion(region, 350), delay)
+      }
+    } else {
+      setSheetMemoryId(memoryId)
       setSheetPlace(null)
       setSheetOpen(true)
-      router.setParams({ openMemoryId: undefined })
     }
-  }, [params.openMemoryId, router])
+    router.setParams({ openMemoryId: '', placeId: '', placeName: '', placeAddress: '', focusLat: '', focusLng: '' })
+  }, [params.openMemoryId, params.placeId, params.placeName, params.placeAddress, params.focusLat, params.focusLng, router])
 
   const doSearch = useCallback(
     async (q: string) => {
@@ -156,7 +226,7 @@ export default function MapScreen() {
       if (!hasGoogleMapsKey && !edgeFunctionUrl) {
         Alert.alert(
           '검색 비활성화',
-          'Google Maps API 키가 설정되지 않았어요. GOOGLE_MAPS_API_KEY 를 설정해주세요.'
+          'Google Maps API 키가 설정되지 않았어요.\nGOOGLE_MAPS_API_KEY 를 설정해주세요.'
         )
         return
       }
@@ -233,7 +303,7 @@ export default function MapScreen() {
     sessionTokenRef.current = null
     setSavedMarkers((prev) => {
       const without = prev.filter((m) => m.memoryId !== memoryId)
-      return [...without, { memoryId, place }]
+      return [...without, { memoryId, place, isSaved: true, listColor: null }]
     })
   }
 
@@ -243,7 +313,7 @@ export default function MapScreen() {
         ref={mapRef}
         provider={Platform.OS === 'android' ? PROVIDER_GOOGLE : undefined}
         style={styles.map}
-        initialRegion={SEOUL}
+        initialRegion={initialRegionRef.current}
         showsUserLocation
         onRegionChangeComplete={setCurrentRegion}
       >
@@ -251,21 +321,15 @@ export default function MapScreen() {
           ? clusters.map((cluster) => {
               if (cluster.count === 1) {
                 const m = cluster.markers[0]
-                const thumb = m.place.heroPhotoUrl
                 return (
                   <Marker
                     key={`c-${cluster.id}`}
                     coordinate={{ latitude: cluster.latitude, longitude: cluster.longitude }}
                     title={m.place.name}
-                    pinColor="#1a73e8"
                     tracksViewChanges={false}
                     onPress={() => openSavedMarker(m)}
                   >
-                    {thumb ? (
-                      <View style={styles.photoMarker}>
-                        <Image source={{ uri: thumb }} style={styles.photoMarkerImage} />
-                      </View>
-                    ) : undefined}
+                    <SavedMarkerContent marker={m} />
                   </Marker>
                 )
               }
@@ -289,25 +353,17 @@ export default function MapScreen() {
                 </Marker>
               )
             })
-          : savedMarkers.map((m) => {
-              const thumb = m.place.heroPhotoUrl
-              return (
-                <Marker
-                  key={m.memoryId}
-                  coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
-                  title={m.place.name}
-                  pinColor="#1a73e8"
-                  tracksViewChanges={false}
-                  onPress={() => openSavedMarker(m)}
-                >
-                  {thumb ? (
-                    <View style={styles.photoMarker}>
-                      <Image source={{ uri: thumb }} style={styles.photoMarkerImage} />
-                    </View>
-                  ) : undefined}
-                </Marker>
-              )
-            })}
+          : savedMarkers.map((m) => (
+              <Marker
+                key={m.memoryId}
+                coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
+                title={m.place.name}
+                tracksViewChanges={false}
+                onPress={() => openSavedMarker(m)}
+              >
+                <SavedMarkerContent marker={m} />
+              </Marker>
+            ))}
         {results.map((r) => (
           <Marker
             key={r.googlePlaceId}
@@ -388,6 +444,26 @@ const styles = StyleSheet.create({
     borderColor: '#fff',
     overflow: 'hidden',
     backgroundColor: '#1a73e8',
+  },
+  savedDot: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    borderWidth: 3,
+    borderColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 4,
+  },
+  savedDotInner: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#fff',
   },
   photoMarkerImage: { width: '100%', height: '100%' },
   clusterBubble: {

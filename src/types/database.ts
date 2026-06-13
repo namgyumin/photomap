@@ -23,6 +23,15 @@ export interface PlaceLatLng {
   longitude: number
 }
 
+// 저장 목록 (색상 지정 가능)
+export interface SavedList {
+  id: string
+  user_id: string
+  name: string
+  color: string
+  created_at: string
+}
+
 // visits = memory
 export interface Memory {
   id: string
@@ -34,16 +43,20 @@ export interface Memory {
   amount_spent: number | null
   hero_media_id: string | null
   is_saved: boolean
+  saved_list_id: string | null
   created_at: string
   updated_at: string
 }
 
 // visit_photos = media
+// 하이브리드: 원본은 유저 기기(local_asset_id), 서버엔 썸네일만.
+// storage_path 는 공유 시점에 원본 업로드 후 채워짐 (그 전엔 null).
 export interface Media {
   id: string
   visit_id: string
   uploader_id: string
-  storage_path: string
+  storage_path: string | null
+  local_asset_id: string | null
   thumbnail_128: string | null
   thumbnail_512: string | null
   width: number | null
@@ -110,7 +123,10 @@ export interface MemoryListItem {
   note: string | null
   amount_spent: number | null
   hero_media_id: string | null
-  place: (Pick<Place, 'id' | 'display_name' | 'address'> & {
+  is_saved: boolean
+  saved_list_id: string | null
+  list_color: string | null
+  place: (Pick<Place, 'id' | 'google_place_id' | 'display_name' | 'address'> & {
     latitude: number | null
     longitude: number | null
   }) | null

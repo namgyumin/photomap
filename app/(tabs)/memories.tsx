@@ -11,12 +11,17 @@ import {
   TextInput,
   View,
 } from 'react-native'
+import { BannerAd, BannerAdSize, TestIds } from 'react-native-google-mobile-ads'
+
+const BANNER_AD_UNIT_ID = __DEV__
+  ? TestIds.ADAPTIVE_BANNER
+  : 'ca-app-pub-1579879380097498/4973662054'
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { SharedImportModal } from '../../src/components/SharedImportModal'
 import { resolveMediaUri } from '../../src/lib/media'
-import { importSharedMemory, listMyMemories } from '../../src/services/memories'
-import type { ImportMode, MemoryListItem } from '../../src/types/database'
+import { importSharedMemory, listMyMemories, listSavedLists } from '../../src/services/memories'
+import type { ImportMode, MemoryListItem, SavedList } from '../../src/types/database'
 import { useAuth } from '../../src/hooks/useAuth'
 
 export default function MemoriesScreen() {
@@ -26,24 +31,48 @@ export default function MemoriesScreen() {
   const autoHandledTokenRef = useRef<string | null>(null)
 
   const [items, setItems] = useState<MemoryListItem[]>([])
+  const [savedLists, setSavedLists] = useState<SavedList[]>([])
   const [loading, setLoading] = useState(false)
   const [token, setToken] = useState('')
   const [importVisible, setImportVisible] = useState(false)
+  const [query, setQuery] = useState('')
 
   const load = useCallback(async () => {
     if (!userId) {
       setItems([])
+      setSavedLists([])
       return
     }
     setLoading(true)
     try {
-      setItems(await listMyMemories())
+      const [memories, lists] = await Promise.all([listMyMemories(), listSavedLists()])
+      setItems(memories)
+      setSavedLists(lists)
     } catch (e) {
       Alert.alert('불러오기 실패', String((e as Error).message))
     } finally {
       setLoading(false)
     }
   }, [userId])
+
+  // 목록 미지정 기록만 메인에 바로 노출. 목록 소속 기록은 목록 카드로 진입.
+  const noListItems = items.filter((it) => it.saved_list_id == null)
+  const listCounts = new Map<string, number>()
+  for (const it of items) {
+    if (it.saved_list_id) listCounts.set(it.saved_list_id, (listCounts.get(it.saved_list_id) ?? 0) + 1)
+  }
+
+  // 검색 중에는 목록 소속 포함 전체 기록에서 장소명/주소/메모 매칭
+  const q = query.trim().toLowerCase()
+  const searchMode = q.length > 0
+  const visibleItems = searchMode
+    ? items.filter(
+        (it) =>
+          (it.place?.display_name ?? '').toLowerCase().includes(q) ||
+          (it.place?.address ?? '').toLowerCase().includes(q) ||
+          (it.note ?? '').toLowerCase().includes(q)
+      )
+    : noListItems
 
   useFocusEffect(
     useCallback(() => {
@@ -70,16 +99,16 @@ export default function MemoriesScreen() {
   }, [params.token, params.autoImport, userId])
 
   const openOnMap = (id: string) => {
-    router.push({ pathname: '/', params: { openMemoryId: id } })
-  }
-
-  const startImport = () => {
-    if (!token.trim()) {
-      Alert.alert('토큰 필요', '공유 토큰을 입력해주세요.')
-      return
+    const it = items.find((m) => m.id === id)
+    const params: Record<string, string> = { openMemoryId: id }
+    if (it?.place?.latitude != null && it?.place?.longitude != null) {
+      params.placeId = it.place.google_place_id
+      params.placeName = it.place.display_name ?? ''
+      params.placeAddress = it.place.address ?? ''
+      params.focusLat = String(it.place.latitude)
+      params.focusLng = String(it.place.longitude)
     }
-    // 충돌 가능성 → 항상 모달 확인 (PRD: 내 기록 유지 / 덮어쓰기 / 취소)
-    setImportVisible(true)
+    router.push({ pathname: '/', params })
   }
 
   const runImport = async (mode: ImportMode) => {
@@ -104,32 +133,57 @@ export default function MemoriesScreen() {
   }
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
-      <View style={styles.importBar}>
+    <SafeAreaView style={styles.container} edges={[]}>
+      <View style={styles.searchBar}>
         <TextInput
-          style={styles.tokenInput}
-          placeholder="공유 토큰 입력"
-          value={token}
-          onChangeText={setToken}
+          style={styles.searchInput}
+          placeholder="내가 갔던 곳 검색"
+          value={query}
+          onChangeText={setQuery}
           autoCapitalize="none"
+          clearButtonMode="while-editing"
+          returnKeyType="search"
         />
-        <Pressable style={styles.importBtn} onPress={startImport}>
-          <Text style={styles.importBtnText}>가져오기</Text>
-        </Pressable>
       </View>
 
       <FlatList
-        data={items}
+        data={visibleItems}
         keyExtractor={(it) => it.id}
         contentContainerStyle={items.length === 0 ? styles.listEmpty : styles.list}
         refreshControl={<RefreshControl refreshing={loading} onRefresh={load} />}
-        ListHeaderComponent={<Text style={styles.header}># 내가 갔던 곳</Text>}
+        keyboardShouldPersistTaps="handled"
+        ListHeaderComponent={
+          searchMode ? null : (
+            <>
+              {savedLists.length > 0 && (
+                <View style={styles.listsSection}>
+                  <Text style={styles.sectionTitle}>목록</Text>
+                  {savedLists.map((list) => (
+                    <Pressable
+                      key={list.id}
+                      style={styles.listCard}
+                      onPress={() => router.push({ pathname: '/list/[id]', params: { id: list.id } })}
+                    >
+                      <View style={[styles.listColorDot, { backgroundColor: list.color }]} />
+                      <Text style={styles.listCardName}>{list.name}</Text>
+                      <Text style={styles.listCardCount}>{listCounts.get(list.id) ?? 0}곳</Text>
+                      <Text style={styles.listCardChevron}>›</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+              {noListItems.length > 0 && <Text style={styles.sectionTitle}>기록</Text>}
+            </>
+          )
+        }
         ListEmptyComponent={
           loading ? (
             <ActivityIndicator style={{ marginTop: 40 }} />
-          ) : (
+          ) : searchMode ? (
+            <Text style={styles.emptyBody}>검색 결과가 없어요.</Text>
+          ) : items.length === 0 ? (
             <Text style={styles.emptyBody}>아직 기록이 없어요. 지도에서 장소를 저장해보세요.</Text>
-          )
+          ) : null
         }
         renderItem={({ item }) => {
           const thumb = resolveMediaUri(item.hero?.thumbnail_512 ?? item.hero?.storage_path ?? null)
@@ -164,6 +218,12 @@ export default function MemoriesScreen() {
         onSelect={runImport}
         onCancel={() => setImportVisible(false)}
       />
+
+      <BannerAd
+        unitId={BANNER_AD_UNIT_ID}
+        size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
+        requestOptions={{ requestNonPersonalizedAdsOnly: false }}
+      />
     </SafeAreaView>
   )
 }
@@ -171,27 +231,37 @@ export default function MemoriesScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff', padding: 24 },
-  importBar: {
-    flexDirection: 'row',
-    gap: 8,
+  searchBar: {
     paddingHorizontal: 16,
     paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#f0f0f0',
   },
-  tokenInput: {
-    flex: 1,
+  searchInput: {
     backgroundColor: '#f5f5f5',
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 9,
     fontSize: 14,
   },
-  importBtn: { backgroundColor: '#1a73e8', borderRadius: 8, paddingHorizontal: 16, justifyContent: 'center' },
-  importBtnText: { color: '#fff', fontWeight: '600' },
   list: { padding: 16 },
   listEmpty: { flexGrow: 1, padding: 16 },
-  header: { fontSize: 24, fontWeight: '800', marginBottom: 16 },
+  listsSection: { marginBottom: 20 },
+  sectionTitle: { fontSize: 14, fontWeight: '700', color: '#888', marginBottom: 8 },
+  listCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    backgroundColor: '#F8F9FA',
+    borderRadius: 14,
+    marginBottom: 8,
+  },
+  listColorDot: { width: 16, height: 16, borderRadius: 8 },
+  listCardName: { flex: 1, fontSize: 16, fontWeight: '600', color: '#222' },
+  listCardCount: { fontSize: 13, color: '#888' },
+  listCardChevron: { fontSize: 20, color: '#bbb', marginTop: -2 },
   card: {
     flexDirection: 'row',
     gap: 12,

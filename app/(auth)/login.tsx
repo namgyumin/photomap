@@ -162,7 +162,7 @@ export default function LoginScreen() {
   const handleGuestSignIn = () => {
     Alert.alert(
       '게스트로 시작할까요?',
-      '게스트 데이터는 로그아웃하는 순간 바로 삭제되고, 마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요. 같은 게스트 계정으로 다시 로그인할 수 없어요.',
+      '게스트 데이터는 로그아웃하는 순간 바로 삭제돼요.\n마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요.\n같은 게스트 계정으로 다시 로그인할 수 없어요.',
       [
         { text: '취소', style: 'cancel' },
         { text: '계속', onPress: () => void performGuestSignIn() },

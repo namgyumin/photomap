@@ -6,6 +6,38 @@ export async function signOut(): Promise<void> {
   if (error) throw error
 }
 
+// 게스트 계정 삭제 + 로그아웃.
+// storage 파일은 SQL 로 못 지움 (Supabase 가 storage 테이블 직접 DELETE 차단)
+// → Storage API 로 먼저 삭제 후 delete_current_guest_account RPC 호출.
+export async function deleteGuestAccountAndSignOut(): Promise<void> {
+  const { data: auth } = await supabase.auth.getUser()
+  const userId = auth.user?.id
+  if (!userId) throw new Error('not authenticated')
+
+  const { data: rows, error } = await supabase
+    .from('visit_photos')
+    .select('storage_path, thumbnail_128, thumbnail_512')
+    .eq('uploader_id', userId)
+  if (error) throw error
+
+  const paths = (rows ?? [])
+    .flatMap((r) => [r.storage_path, r.thumbnail_128, r.thumbnail_512])
+    .filter((p): p is string => Boolean(p) && !p!.startsWith('http') && !p!.startsWith('file:'))
+
+  // Storage remove 는 한 번에 너무 많으면 실패할 수 있어 100개씩 분할
+  for (let i = 0; i < paths.length; i += 100) {
+    const { error: storageErr } = await supabase.storage
+      .from('visit-photos')
+      .remove(paths.slice(i, i + 100))
+    if (storageErr) throw storageErr
+  }
+
+  const { error: rpcErr } = await supabase.rpc('delete_current_guest_account')
+  if (rpcErr) throw rpcErr
+
+  await supabase.auth.signOut({ scope: 'local' })
+}
+
 export async function signOutGuest(): Promise<void> {
   try {
     await Promise.all([

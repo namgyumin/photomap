@@ -3,6 +3,8 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
+  FlatList,
   Image,
   LayoutAnimation,
   Linking,
@@ -11,26 +13,40 @@ import {
   Platform,
   Pressable,
   ScrollView,
-  Share,
   StyleSheet,
   Text,
+  TextInput,
   UIManager,
   View,
 } from 'react-native'
+import AsyncStorage from '@react-native-async-storage/async-storage'
+import { useInterstitialAd } from '../hooks/useInterstitialAd'
+import { useVideoPlayer, VideoView } from 'expo-video'
 import type { PlaceDetailsResult, PlaceSearchResult } from '../lib/googlePlaces'
 import { fetchPlaceDetails } from '../lib/googlePlaces'
-import { pickMediaMultiple, resolveMediaUri, uploadMedia, VideoTooLongError, MAX_VIDEO_SECONDS } from '../lib/media'
+import {
+  cacheVideoLocally,
+  localVideoUri,
+  MAX_VIDEO_SECONDS,
+  pickMedia,
+  resolveLocalAssetUri,
+  resolveMediaUri,
+  uploadMedia,
+  VideoTooLongError,
+} from '../lib/media'
 import {
   addMediaToVisit,
   createOrGetPlace,
+  createSavedList,
   createVisitMemory,
+  deleteListIfEmpty,
   deleteMedia,
+  deleteVisitMemory,
   getMemoryDetail,
-  setHeroMedia,
-  updateMediaLocation,
+  listSavedLists,
   updateVisitMemoryFields,
 } from '../services/memories'
-import type { Media, MemoryDetail, Visibility } from '../types/database'
+import type { Media, MemoryDetail, SavedList, Visibility } from '../types/database'
 
 interface Props {
   visible: boolean
@@ -42,21 +58,286 @@ interface Props {
   onChanged?: () => void
 }
 
+// ============================================================
+// 공유 상수 (fixplan part1)
+// ============================================================
+
+const COLORS = {
+  primary: '#1C7B6C',
+  primaryDark: '#064B56',
+  primaryLight: '#D8EEE9',
+  actionBlueLight: '#D8F3F7',
+  textDark: '#1A1A1A',
+  textGray: '#5F6368',
+  textLightGray: '#70757A',
+  border: '#E8EAED',
+  bgMuted: '#F0F0EE',
+  cardBg: '#F1F3F4',
+  white: '#FFFFFF',
+  open: '#137333',
+  closed: '#C62828',
+  closingSoon: '#B06000',
+  star: '#FBC02D',
+}
+
+const SHEET_RADIUS = 30
+
+const SPACING = {
+  horizontal: 24,
+  section: 20,
+  small: 8,
+  medium: 12,
+  large: 18,
+}
+
+const HEADER = {
+  titleSizeExpanded: 28,
+  titleSizeCollapsed: 23,
+  subtitleSize: 17,
+  metaSize: 16,
+  lineHeightTitle: 34,
+  lineHeightSubtitle: 23,
+}
+
+const ACTION_BUTTON = {
+  height: 52,
+  borderRadius: 26,
+  paddingHorizontal: 22,
+  gap: 12,
+}
+
+const ICON_BUTTON = {
+  size: 36,
+  borderRadius: 18,
+}
+
+// ============================================================
+// 바텀시트 3단계 snap (fixplan part2)
+// ============================================================
+
+type SheetSnapState = 'collapsed' | 'medium' | 'expanded'
+
+const SCREEN_WIDTH = Dimensions.get('window').width
+const SCREEN_HEIGHT = Dimensions.get('window').height
+
+const EXPANDED_HEIGHT = SCREEN_HEIGHT * 0.91
+const MEDIUM_HEIGHT = SCREEN_HEIGHT * 0.74
+const COLLAPSED_HEIGHT = SCREEN_HEIGHT * 0.38
+
+// dragY = expanded 상단 기준 top offset. 0 = expanded, CLOSED_OFFSET = 완전히 숨김
+const SNAP_OFFSET: Record<SheetSnapState, number> = {
+  expanded: 0,
+  medium: EXPANDED_HEIGHT - MEDIUM_HEIGHT,
+  collapsed: EXPANDED_HEIGHT - COLLAPSED_HEIGHT,
+}
+const CLOSED_OFFSET = EXPANDED_HEIGHT
+
+// 핸들바 영역은 탭부터 드래그, 그 아래 헤더 영역은 움직임이 생겼을 때만 드래그
+const HANDLE_DRAG_REGION = 40
+const SHEET_DRAG_REGION = 96
+const VELOCITY_PROJECTION_MS = 250
+
+const SPRING_CONFIG = { tension: 60, friction: 11, useNativeDriver: false as const }
+
+function clampOffset(offset: number): number {
+  return Math.max(0, Math.min(CLOSED_OFFSET, offset))
+}
+
+// 손 떼는 순간의 위치 + 속도로 가장 가까운 snap 상태 결정
+function resolveSnapTarget(
+  offset: number,
+  vy: number,
+  snapOffsets: Record<SheetSnapState, number>
+): SheetSnapState | 'closed' {
+  const projected = offset + vy * VELOCITY_PROJECTION_MS
+  const candidates: Array<[SheetSnapState | 'closed', number]> = [
+    ['expanded', snapOffsets.expanded],
+    ['medium', snapOffsets.medium],
+    ['collapsed', snapOffsets.collapsed],
+    ['closed', CLOSED_OFFSET],
+  ]
+  let best = candidates[0]
+  for (const candidate of candidates) {
+    if (Math.abs(candidate[1] - projected) < Math.abs(best[1] - projected)) best = candidate
+  }
+  return best[0]
+}
+
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
-const UNSUPPORTED_MSG = '우리는 사진 저장 앱입니다. 이 기능은 지원하지 않아요!'
+const UNSUPPORTED_MSG = '이 기능은 지원하지 않아요'
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true)
 }
 
-const EXPANDED_DRAG = -200 // dragY 기준 확장 상태 안착 지점
-const SPRING_CONFIG = { tension: 60, friction: 11, useNativeDriver: false as const }
-
 function animateLayout() {
   LayoutAnimation.configureNext(LayoutAnimation.create(220, 'easeInEaseOut', 'opacity'))
+}
+
+function thumbUri(m: Media): string | null {
+  return resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
+}
+
+function fullUri(m: Media): string | null {
+  return resolveMediaUri(m.storage_path ?? m.thumbnail_512)
+}
+
+// 그리드 slot 인라인 영상 — 렌더 즉시 muted 자동재생 + loop
+function SlotVideo({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri, (p) => {
+    p.loop = true
+    p.muted = true
+    p.play()
+  })
+  return (
+    <VideoView player={player} style={styles.videoFill} nativeControls={false} contentFit="cover" />
+  )
+}
+
+// 전체화면 뷰어 영상 — 현재 페이지일 때만 재생 (스와이프 시 이웃 영상 소리 겹침 방지)
+function ViewerVideo({ uri, active }: { uri: string; active: boolean }) {
+  const player = useVideoPlayer(uri, (p) => {
+    p.loop = true
+  })
+  useEffect(() => {
+    if (active) {
+      player.play()
+    } else {
+      player.pause()
+    }
+  }, [active, player])
+  return <VideoView player={player} style={styles.viewerVideo} contentFit="contain" />
+}
+
+const TABS = ['개요', '메뉴', '리뷰', '사진', '업데이트', '정보'] as const
+
+// ============================================================
+// 사진 레이아웃 시스템 (fixplan part5)
+// slot 위치는 visit_photos.sort_order 로 영속.
+// layoutType 은 DB 컬럼이 없어 AsyncStorage 로 기기 내 유지
+// (백엔드 컬럼 추가 필요 — part9 문서 참조)
+// ============================================================
+
+type PhotoLayoutType =
+  | 'single' //          A: 1장 전체형
+  | 'twoVertical' //     B: 2장 좌우 분할
+  | 'twoHorizontal' //   C: 2장 위아래
+  | 'threeLeftHero' //   D: 왼쪽 큰 사진 + 오른쪽 2장
+  | 'threeRightHero' //  E: 오른쪽 큰 사진 + 왼쪽 2장
+  | 'threeTopHero' //    F: 상단 큰 사진 + 하단 2장
+  | 'threeBottomHero' // G: 상단 2장 + 하단 큰 사진
+
+const LAYOUT_SLOT_COUNT: Record<PhotoLayoutType, number> = {
+  single: 1,
+  twoVertical: 2,
+  twoHorizontal: 2,
+  threeLeftHero: 3,
+  threeRightHero: 3,
+  threeTopHero: 3,
+  threeBottomHero: 3,
+}
+
+const LAYOUT_OPTIONS: Array<{ type: PhotoLayoutType; label: string }> = [
+  { type: 'single', label: '1장 전체' },
+  { type: 'twoVertical', label: '2장 좌우' },
+  { type: 'twoHorizontal', label: '2장 위아래' },
+  { type: 'threeLeftHero', label: '왼쪽 대표' },
+  { type: 'threeRightHero', label: '오른쪽 대표' },
+  { type: 'threeTopHero', label: '상단 대표' },
+  { type: 'threeBottomHero', label: '하단 대표' },
+]
+
+const LAYOUT_STORAGE_PREFIX = 'photomap:placeSheetLayout:'
+
+// 저장 목록 색상 팔레트
+const LIST_COLORS = [
+  '#1C7B6C',
+  '#D93025',
+  '#F9AB00',
+  '#1A73E8',
+  '#9334E6',
+  '#E8710A',
+  '#0B8043',
+  '#F06292',
+]
+
+function isPhotoLayoutType(v: string | null): v is PhotoLayoutType {
+  return v != null && v in LAYOUT_SLOT_COUNT
+}
+
+function defaultLayoutFor(count: number): PhotoLayoutType {
+  if (count <= 1) return 'single'
+  if (count === 2) return 'twoVertical'
+  return 'threeLeftHero'
+}
+
+// 레이아웃 선택 모달용 미니 프리뷰
+function LayoutPreviewThumb({ type }: { type: PhotoLayoutType }) {
+  switch (type) {
+    case 'single':
+      return (
+        <View style={styles.pvFrame}>
+          <View style={styles.pvBlock} />
+        </View>
+      )
+    case 'twoVertical':
+      return (
+        <View style={[styles.pvFrame, styles.pvRow]}>
+          <View style={styles.pvBlock} />
+          <View style={styles.pvBlock} />
+        </View>
+      )
+    case 'twoHorizontal':
+      return (
+        <View style={styles.pvFrame}>
+          <View style={styles.pvBlock} />
+          <View style={styles.pvBlock} />
+        </View>
+      )
+    case 'threeLeftHero':
+      return (
+        <View style={[styles.pvFrame, styles.pvRow]}>
+          <View style={[styles.pvBlock, styles.pvHero]} />
+          <View style={styles.pvCol}>
+            <View style={styles.pvBlock} />
+            <View style={styles.pvBlock} />
+          </View>
+        </View>
+      )
+    case 'threeRightHero':
+      return (
+        <View style={[styles.pvFrame, styles.pvRow]}>
+          <View style={styles.pvCol}>
+            <View style={styles.pvBlock} />
+            <View style={styles.pvBlock} />
+          </View>
+          <View style={[styles.pvBlock, styles.pvHero]} />
+        </View>
+      )
+    case 'threeTopHero':
+      return (
+        <View style={styles.pvFrame}>
+          <View style={[styles.pvBlock, styles.pvHero]} />
+          <View style={styles.pvRowInner}>
+            <View style={styles.pvBlock} />
+            <View style={styles.pvBlock} />
+          </View>
+        </View>
+      )
+    case 'threeBottomHero':
+      return (
+        <View style={styles.pvFrame}>
+          <View style={styles.pvRowInner}>
+            <View style={styles.pvBlock} />
+            <View style={styles.pvBlock} />
+          </View>
+          <View style={[styles.pvBlock, styles.pvHero]} />
+        </View>
+      )
+  }
 }
 
 export function PlaceDetailSheet({
@@ -68,76 +349,105 @@ export function PlaceDetailSheet({
   onSaved,
   onChanged,
 }: Props) {
+  const { show: showInterstitial } = useInterstitialAd()
+
+  // Sheet
+  const [isEditing, setIsEditing] = useState(false)
+  const [editLoading, setEditLoading] = useState(false)
+  const [snapState, setSnapState] = useState<SheetSnapState>('medium')
+  const snapStateRef = useRef<SheetSnapState>('medium')
+  const dragY = useRef(new Animated.Value(CLOSED_OFFSET)).current
+  const dragBase = useRef(0)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
+  // Collapsed 높이는 헤더+액션버튼 실측 높이에 맞춰 동적 조정 (38%는 fallback)
+  const snapOffsetsRef = useRef<Record<SheetSnapState, number>>({ ...SNAP_OFFSET })
+  const actionScrollRef = useRef<ScrollView>(null)
+  const handleCollapsedContentLayout = (e: { nativeEvent: { layout: { height: number } } }) => {
+    const HANDLE_AREA = 27 // marginTop 10 + bar 5 + marginBottom 12
+    const measured = e.nativeEvent.layout.height + HANDLE_AREA + 16
+    const clamped = Math.min(Math.max(measured, SCREEN_HEIGHT * 0.16), SCREEN_HEIGHT * 0.6)
+    const next = EXPANDED_HEIGHT - clamped
+    if (Math.abs(snapOffsetsRef.current.collapsed - next) < 1) return
+    snapOffsetsRef.current = { ...snapOffsetsRef.current, collapsed: next }
+    if (snapStateRef.current === 'collapsed') {
+      Animated.spring(dragY, { toValue: next, ...SPRING_CONFIG }).start()
+    }
+  }
+
+  // Data
   const [currentId, setCurrentId] = useState<string | null>(memoryId ?? null)
   const [detail, setDetail] = useState<MemoryDetail | null>(null)
+  const [placeDetails, setPlaceDetails] = useState<PlaceDetailsResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [isDirty, setIsDirty] = useState(false)
+
+  // Photo layout
+  const [layoutType, setLayoutType] = useState<PhotoLayoutType>('single')
+  const [layoutPickerVisible, setLayoutPickerVisible] = useState(false)
+  const [mediaBusy, setMediaBusy] = useState(false)
+
+  // Photo viewer
+  const [viewerVisible, setViewerVisible] = useState(false)
+  const [viewerIndex, setViewerIndex] = useState(0)
+  const viewerListRef = useRef<FlatList<Media>>(null)
+
+  // UI
   const [activeTab, setActiveTab] = useState(0)
   const [hoursExpanded, setHoursExpanded] = useState(false)
-  const [sheetExpanded, setSheetExpanded] = useState(false)
-  const [isEditing, setIsEditing] = useState(false)
-  const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null)
-  const [editLoading, setEditLoading] = useState(false)
-  const [placeDetails, setPlaceDetails] = useState<PlaceDetailsResult | null>(null)
+  const [isSaved, setIsSaved] = useState(true)
+  const [visitedAt, setVisitedAt] = useState(todayIso())
+  const [visibility] = useState<Visibility>('private')
 
-  const sheetRef = useRef(null)
-  // 단일 드래그 값: 음수 = 위로(시트 확장), 양수 = 아래로(시트 내려감/닫기)
-  const dragY = useRef(new Animated.Value(0)).current
-  const dragBase = useRef(0)
+  const settleTo = useCallback(
+    (target: SheetSnapState, vy: number) => {
+      animateLayout()
+      snapStateRef.current = target
+      setSnapState(target)
+      Animated.spring(dragY, {
+        toValue: snapOffsetsRef.current[target],
+        velocity: vy,
+        ...SPRING_CONFIG,
+      }).start()
+    },
+    [dragY]
+  )
+
+  const closeSheet = useCallback(() => {
+    Animated.timing(dragY, {
+      toValue: CLOSED_OFFSET,
+      duration: 220,
+      useNativeDriver: false,
+    }).start(() => {
+      onCloseRef.current()
+    })
+  }, [dragY])
 
   const panResponder = useMemo(
     () =>
       PanResponder.create({
-        onStartShouldSetPanResponder: (evt) => evt.nativeEvent.locationY < 60,
+        onStartShouldSetPanResponder: (evt) => evt.nativeEvent.locationY < HANDLE_DRAG_REGION,
         onMoveShouldSetPanResponder: (evt, gestureState) =>
-          evt.nativeEvent.locationY < 60 && Math.abs(gestureState.dy) > 5,
+          evt.nativeEvent.locationY < SHEET_DRAG_REGION && Math.abs(gestureState.dy) > 6,
         onPanResponderGrant: () => {
-          dragBase.current = sheetExpanded ? EXPANDED_DRAG : 0
+          dragBase.current = snapOffsetsRef.current[snapStateRef.current]
         },
         onPanResponderMove: (_, gestureState) => {
-          // 위로는 저항감 있게(0.5배), 아래로는 손가락을 그대로 따라오게
-          const delta = gestureState.dy < 0 ? gestureState.dy * 0.5 : gestureState.dy
-          dragY.setValue(Math.max(EXPANDED_DRAG, dragBase.current + delta))
+          dragY.setValue(clampOffset(dragBase.current + gestureState.dy))
         },
         onPanResponderRelease: (_, gestureState) => {
-          const { dy, vy } = gestureState
-          const flickDown = vy > 0.8
-          const flickUp = vy < -0.8
-          if ((dy > 80 || flickDown) && !flickUp) {
-            if (sheetExpanded) {
-              animateLayout()
-              setSheetExpanded(false)
-              Animated.spring(dragY, { toValue: 0, velocity: vy, ...SPRING_CONFIG }).start()
-            } else {
-              // 아래로 밀어내며 자연스럽게 닫기
-              Animated.timing(dragY, { toValue: 600, duration: 220, useNativeDriver: false }).start(
-                () => {
-                  onClose()
-                  dragY.setValue(0)
-                }
-              )
-            }
-          } else if (dy < -80 || flickUp) {
-            animateLayout()
-            setSheetExpanded(true)
-            Animated.spring(dragY, { toValue: EXPANDED_DRAG, velocity: vy, ...SPRING_CONFIG }).start()
+          const offset = clampOffset(dragBase.current + gestureState.dy)
+          const target = resolveSnapTarget(offset, gestureState.vy, snapOffsetsRef.current)
+          if (target === 'closed') {
+            closeSheet()
           } else {
-            Animated.spring(dragY, {
-              toValue: sheetExpanded ? EXPANDED_DRAG : 0,
-              velocity: vy,
-              ...SPRING_CONFIG,
-            }).start()
+            settleTo(target, gestureState.vy)
           }
         },
       }),
-    [onClose, sheetExpanded, dragY]
+    [dragY, settleTo, closeSheet]
   )
-
-  const [visitedAt, setVisitedAt] = useState(todayIso())
-  const [note, setNote] = useState('')
-  const [isSaved, setIsSaved] = useState(true)
-  const [visibility, setVisibility] = useState<Visibility>('private')
 
   const load = useCallback(async (id: string) => {
     setLoading(true)
@@ -145,9 +455,9 @@ export function PlaceDetailSheet({
       const d = await getMemoryDetail(id)
       setDetail(d)
       setVisitedAt(d.memory.visited_at?.slice(0, 10) || todayIso())
-      setNote(d.memory.note ?? '')
       setIsSaved(d.memory.is_saved)
-      setVisibility(d.memory.visibility)
+      const storedLayout = await AsyncStorage.getItem(LAYOUT_STORAGE_PREFIX + id).catch(() => null)
+      setLayoutType(isPhotoLayoutType(storedLayout) ? storedLayout : defaultLayoutFor(d.media.length))
     } catch (e) {
       Alert.alert('불러오기 실패', String((e as Error).message))
     } finally {
@@ -164,20 +474,26 @@ export function PlaceDetailSheet({
       setCurrentId(null)
       setDetail(null)
       setVisitedAt(todayIso())
-      setNote('')
       setIsSaved(true)
-      setVisibility('private')
     }
     setActiveTab(0)
     setHoursExpanded(false)
-    setSheetExpanded(false)
     setIsEditing(false)
-    setSelectedMediaId(null)
-    dragY.setValue(0)
+    setViewerVisible(false)
+    // 처음 열릴 때는 Medium으로 snap
+    snapStateRef.current = 'medium'
+    setSnapState('medium')
+    dragY.setValue(CLOSED_OFFSET)
+    Animated.spring(dragY, { toValue: snapOffsetsRef.current.medium, ...SPRING_CONFIG }).start()
   }, [visible, memoryId, load, dragY])
 
-  // Google Places 상세 정보 로드 (실패해도 기본 정보는 표시)
   const googlePlaceId = searchPlace?.googlePlaceId ?? detail?.place?.google_place_id ?? null
+
+  // 장소 바뀌면 액션 버튼 스크롤을 처음(왼쪽)으로
+  useEffect(() => {
+    actionScrollRef.current?.scrollTo({ x: 0, animated: false })
+  }, [googlePlaceId, visible])
+
   useEffect(() => {
     if (!visible || !googlePlaceId) {
       setPlaceDetails(null)
@@ -198,190 +514,94 @@ export function PlaceDetailSheet({
   const placeAddress = detail?.place?.address ?? searchPlace?.address ?? null
   const media = detail?.media ?? []
 
-  const selectedMediaIndex = media.findIndex(m => m.id === selectedMediaId)
-  const canGoNext = selectedMediaIndex < media.length - 1
-  const canGoPrev = selectedMediaIndex > 0
-
-  const selectMedia = (id: string | null) => {
-    animateLayout()
-    setSelectedMediaId(id)
-  }
-
-  const goToNextPhoto = () => {
-    if (canGoNext) {
-      setSelectedMediaId(media[selectedMediaIndex + 1]?.id ?? null)
-    }
-  }
-
-  const goToPrevPhoto = () => {
-    if (canGoPrev) {
-      setSelectedMediaId(media[selectedMediaIndex - 1]?.id ?? null)
-    }
-  }
-
-  const handleEditToggle = () => {
-    setEditLoading(true)
-    setTimeout(() => {
-      animateLayout()
-      setIsEditing(!isEditing)
-      setEditLoading(false)
-    }, 100)
-  }
-
-  const handleCall = () => {
-    const phone = placeDetails?.internationalPhoneNumber
-    if (phone) {
-      Linking.openURL(`tel:${phone.replace(/[^+\d]/g, '')}`).catch(() => {})
-    } else {
-      handleUnsupported('통화')
-    }
-  }
-
-  const renderPhotoLayout = () => {
-    const count = media.length
-    if (count === 0) return null
-    if (count === 1) {
-      return (
-        <View style={styles.photoLayoutSingle}>
-          {media.map((m) => {
-            const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
-            const isSelected = m.id === selectedMediaId
-            return uri ? (
-              <Pressable
-                key={m.id}
-                style={[styles.photoLayoutSingleItem, isSelected && styles.photoSelected]}
-                onLongPress={() => selectMedia(m.id)}
-              >
-                <Image source={{ uri }} style={styles.photoImage} />
-                {isSelected && (
-                  <View style={styles.photoNavOverlay}>
-                    <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
-                      <Text style={styles.photoNavText}>‹</Text>
-                    </Pressable>
-                    <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
-                      <Text style={styles.photoNavText}>›</Text>
-                    </Pressable>
-                  </View>
-                )}
-              </Pressable>
-            ) : null
-          })}
-        </View>
-      )
-    }
-    if (count === 2) {
-      const layout = count === 2 ? 'vertical' : 'horizontal'
-      return (
-        <ScrollView
-          horizontal={layout === 'horizontal'}
-          showsHorizontalScrollIndicator={layout === 'horizontal'}
-          style={layout === 'vertical' ? styles.photoLayoutDouble : styles.photoLayoutDoubleH}
-          scrollEnabled={layout === 'horizontal'}
-        >
-          <View style={layout === 'vertical' ? {} : styles.photoLayoutDoubleHContainer}>
-            {media.map((m) => {
-              const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
-              const isSelected = m.id === selectedMediaId
-              return uri ? (
-                <Pressable
-                  key={m.id}
-                  style={[
-                    layout === 'vertical' ? styles.photoLayoutDoubleItem : styles.photoLayoutDoubleHItem,
-                    isSelected && styles.photoSelected,
-                  ]}
-                  onLongPress={() => selectMedia(m.id)}
-                >
-                  <Image source={{ uri }} style={styles.photoImage} />
-                  {isSelected && (
-                    <View style={styles.photoNavOverlay}>
-                      <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
-                        <Text style={styles.photoNavText}>‹</Text>
-                      </Pressable>
-                      <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
-                        <Text style={styles.photoNavText}>›</Text>
-                      </Pressable>
-                    </View>
-                  )}
-                </Pressable>
-              ) : null
-            })}
-          </View>
-        </ScrollView>
-      )
-    }
-    if (count >= 3) {
-      const isTopSelected = media[0]?.id === selectedMediaId
-      return (
-        <View style={styles.photoLayoutTriple}>
-          <Pressable
-            style={[styles.photoLayoutTripleTop, isTopSelected && styles.photoSelected]}
-            onLongPress={() => selectMedia(media[0]?.id ?? null)}
-          >
-            {resolveMediaUri(media[0]?.thumbnail_512 ?? media[0]?.storage_path) && (
-              <Image
-                source={{ uri: resolveMediaUri(media[0]?.thumbnail_512 ?? media[0]?.storage_path) as string }}
-                style={styles.photoImage}
-              />
-            )}
-            {isTopSelected && (
-              <View style={styles.photoNavOverlay}>
-                <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
-                  <Text style={styles.photoNavText}>‹</Text>
-                </Pressable>
-                <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
-                  <Text style={styles.photoNavText}>›</Text>
-                </Pressable>
-              </View>
-            )}
-          </Pressable>
-          <View style={styles.photoLayoutTripleBottom}>
-            {media.slice(1, 3).map((m) => {
-              const isSelected = m.id === selectedMediaId
-              return (
-                <Pressable
-                  key={m.id}
-                  style={[styles.photoLayoutTripleBottomItem, isSelected && styles.photoSelected]}
-                  onLongPress={() => selectMedia(m.id)}
-                >
-                  {resolveMediaUri(m.thumbnail_512 ?? m.storage_path) && (
-                    <Image source={{ uri: resolveMediaUri(m.thumbnail_512 ?? m.storage_path) as string }} style={styles.photoImage} />
-                  )}
-                  {isSelected && (
-                    <View style={styles.photoNavOverlay}>
-                      <Pressable style={styles.photoNavBtn} onPress={goToPrevPhoto} disabled={!canGoPrev}>
-                        <Text style={styles.photoNavText}>‹</Text>
-                      </Pressable>
-                      <Pressable style={styles.photoNavBtn} onPress={goToNextPhoto} disabled={!canGoNext}>
-                        <Text style={styles.photoNavText}>›</Text>
-                      </Pressable>
-                    </View>
-                  )}
-                </Pressable>
-              )
-            })}
-          </View>
-        </View>
-      )
-    }
-  }
-
-  const handleSave = async () => {
-    if (!userId) {
-      Alert.alert('로그인 필요', '저장하려면 먼저 로그인해야 해요.')
+  // 하이브리드 렌더 우선순위: 기기 원본(local) → 서버 썸네일/원본
+  // 영상은 앱 문서 폴더 캐시(file://, 재생 보장) 우선 — ph:// 는 expo-video 재생 불가
+  const [localUris, setLocalUris] = useState<Record<string, string>>({})
+  useEffect(() => {
+    const mediaList = detail?.media ?? []
+    if (!mediaList.length) {
+      setLocalUris({})
       return
     }
+    let cancelled = false
+    ;(async () => {
+      const entries: Array<[string, string]> = []
+      for (const m of mediaList) {
+        let uri: string | null = null
+        if (m.media_type === 'video') {
+          uri = await localVideoUri(m.id)
+        } else if (m.local_asset_id) {
+          uri = await resolveLocalAssetUri(m.local_asset_id)
+        }
+        if (uri) entries.push([m.id, uri])
+      }
+      if (!cancelled) setLocalUris(Object.fromEntries(entries))
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [detail])
+
+  // 사진 표시용: 로컬 원본 → 서버 썸네일
+  const photoUri = (m: Media): string | null => localUris[m.id] ?? thumbUri(m)
+  // 영상 재생용: 로컬 원본 → 서버 원본(공유된 것). 없으면 null → 포스터 fallback
+  const videoUri = (m: Media): string | null =>
+    localUris[m.id] ?? (m.storage_path ? resolveMediaUri(m.storage_path) : null)
+
+  // 저장 목록 (색상 지정 가능)
+  const [saveLists, setSaveLists] = useState<SavedList[]>([])
+  const [savePickerVisible, setSavePickerVisible] = useState(false)
+  const [newListName, setNewListName] = useState('')
+  const [newListColor, setNewListColor] = useState(LIST_COLORS[0])
+
+  // 저장 버튼: 미저장 → 목록 선택 모달, 저장됨 → 해제 confirm
+  const handleSave = async () => {
+    if (!userId) {
+      Alert.alert('로그인 필요', '저장하려면\n먼저 로그인해야 해요.')
+      return
+    }
+    if (saving) return
+    if (currentId && isSaved) {
+      Alert.alert('저장 해제', '저장 목록에서 제거할까요?', [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '제거',
+          style: 'destructive',
+          onPress: async () => {
+            setSaving(true)
+            const listId = detail?.memory.saved_list_id ?? null
+            try {
+              await deleteVisitMemory(currentId)
+              if (listId) await deleteListIfEmpty(listId)
+              onChanged?.()
+              onClose()
+            } catch (e) {
+              Alert.alert('삭제 실패', String((e as Error).message))
+            } finally {
+              setSaving(false)
+            }
+          },
+        },
+      ])
+      return
+    }
+    try {
+      setSaveLists(await listSavedLists())
+    } catch {
+      setSaveLists([])
+    }
+    setSavePickerVisible(true)
+  }
+
+  // 목록 선택(또는 목록 없이) → 저장 실행
+  const saveToList = async (listId: string | null) => {
+    setSavePickerVisible(false)
     setSaving(true)
     try {
       if (currentId) {
-        await updateVisitMemoryFields(currentId, {
-          visitedAt,
-          note: note || null,
-          visibility,
-          isSaved: !isSaved,
-        })
+        await updateVisitMemoryFields(currentId, { isSaved: true, savedListId: listId })
         await load(currentId)
         onChanged?.()
-        Alert.alert('저장됨', '기록을 업데이트했어요.')
       } else if (searchPlace) {
         const place = await createOrGetPlace({
           googlePlaceId: searchPlace.googlePlaceId,
@@ -393,64 +613,179 @@ export function PlaceDetailSheet({
         const memory = await createVisitMemory({
           placeId: place.id,
           visitedAt,
-          note: note || null,
           visibility,
-          isSaved: !isSaved,
+          isSaved: true,
+          savedListId: listId,
         })
         setCurrentId(memory.id)
         await load(memory.id)
         onSaved?.(memory.id, searchPlace)
         onChanged?.()
-        Alert.alert('저장됨', '내가 갔던 곳에 추가했어요.')
+        showInterstitial()
       }
     } catch (e) {
       Alert.alert('저장 실패', String((e as Error).message))
     } finally {
       setSaving(false)
-      setIsDirty(false)
     }
   }
 
-  const handleAddMedia = async () => {
-    if (!userId) {
-      Alert.alert('로그인 필요', '사진/영상을 추가하려면 먼저 로그인해주세요.')
-      return
-    }
-    if (!currentId) return
+  const handleCreateList = async () => {
+    const name = newListName.trim()
+    if (!name) return
     try {
-      const pickedList = await pickMediaMultiple()
-      if (!pickedList.length) return
-      for (const picked of pickedList) {
-        const isDuplicate = media.some(m => m.storage_path === picked.uri)
-        if (isDuplicate) {
-          Alert.alert('이미 추가됨', '이미 추가된 사진입니다.')
-          continue
-        }
-        const uploaded = await uploadMedia(userId, currentId, picked.uri, picked.mediaType)
-        await addMediaToVisit({
-          visitId: currentId,
-          storagePath: uploaded.storagePath,
-          mediaType: picked.mediaType,
-          durationSeconds: picked.durationSeconds,
-          thumbnail128: uploaded.thumbnail128,
-          thumbnail512: uploaded.thumbnail512,
-          width: picked.width,
-          height: picked.height,
-          capturedAt: picked.capturedAt,
-          latitude: picked.latitude,
-          longitude: picked.longitude,
-        })
+      const list = await createSavedList(name, newListColor)
+      setNewListName('')
+      await saveToList(list.id)
+    } catch (e) {
+      Alert.alert('목록 생성 실패', String((e as Error).message))
+    }
+  }
+
+  // slot 단위 사진 선택→업로드→DB insert. sort_order = slotIndex 로 위치 영속.
+  const pickAndUploadToSlot = async (slotIndex: number): Promise<boolean> => {
+    if (!userId) {
+      Alert.alert('로그인 필요', '사진/영상을 추가하려면\n먼저 로그인해주세요.')
+      return false
+    }
+    if (!currentId) {
+      Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
+      return false
+    }
+    const picked = await pickMedia()
+    if (!picked) return false
+    const uploaded = await uploadMedia(userId, currentId, picked.uri, picked.mediaType)
+    const created = await addMediaToVisit({
+      visitId: currentId,
+      storagePath: uploaded.storagePath,
+      localAssetId: picked.assetId,
+      mediaType: picked.mediaType,
+      durationSeconds: picked.durationSeconds,
+      thumbnail128: uploaded.thumbnail128,
+      thumbnail512: uploaded.thumbnail512,
+      width: picked.width,
+      height: picked.height,
+      capturedAt: picked.capturedAt,
+      latitude: picked.latitude,
+      longitude: picked.longitude,
+      sortOrder: slotIndex,
+    })
+    // 영상은 ph:// 재생 불가 → 앱 문서 폴더로 복사해 file:// 재생 (실패해도 추가 자체는 유지)
+    if (picked.mediaType === 'video') {
+      await cacheVideoLocally(created.id, picked.uri).catch(() => {})
+    }
+    return true
+  }
+
+  const showMediaError = (e: unknown) => {
+    if (e instanceof VideoTooLongError) {
+      Alert.alert('영상이 너무 길어요', `${MAX_VIDEO_SECONDS}초 이하 영상만 추가할 수 있어요.`)
+    } else if ((e as Error).message === 'PERMISSION_DENIED') {
+      Alert.alert('권한 필요', '사진 라이브러리 접근 권한이 필요해요.')
+    } else {
+      Alert.alert('사진 처리 실패', String((e as Error).message))
+    }
+  }
+
+  const handleAddToSlot = async (slotIndex: number) => {
+    if (mediaBusy) return
+    setMediaBusy(true)
+    try {
+      const added = await pickAndUploadToSlot(slotIndex)
+      if (added && currentId) {
+        await load(currentId)
+        onChanged?.()
       }
-      await load(currentId)
+    } catch (e) {
+      showMediaError(e)
+    } finally {
+      setMediaBusy(false)
+    }
+  }
+
+  const doDeleteMedia = async (m: Media) => {
+    try {
+      await deleteMedia(m)
+      if (currentId) await load(currentId)
       onChanged?.()
     } catch (e) {
-      if (e instanceof VideoTooLongError) {
-        Alert.alert('영상이 너무 길어요', `${MAX_VIDEO_SECONDS}초 이하 영상만 추가할 수 있어요.`)
-      } else if ((e as Error).message === 'PERMISSION_DENIED') {
-        Alert.alert('권한 필요', '사진 라이브러리 접근 권한이 필요해요.')
-      } else {
-        Alert.alert('추가 실패', String((e as Error).message))
+      Alert.alert('삭제 실패', String((e as Error).message))
+    }
+  }
+
+  const handleReplaceSlot = async (old: Media, slotIndex: number) => {
+    if (mediaBusy) return
+    setMediaBusy(true)
+    try {
+      // 새 사진 업로드 성공 후에만 기존 사진 삭제 (실패 시 기존 유지)
+      const added = await pickAndUploadToSlot(slotIndex)
+      if (added) {
+        await deleteMedia(old)
+        if (currentId) await load(currentId)
+        onChanged?.()
       }
+    } catch (e) {
+      showMediaError(e)
+    } finally {
+      setMediaBusy(false)
+    }
+  }
+
+  const handleFilledSlotPress = (m: Media, slotIndex: number) => {
+    Alert.alert('사진', '이 사진을 어떻게 할까요?', [
+      { text: '교체', onPress: () => void handleReplaceSlot(m, slotIndex) },
+      { text: '삭제', style: 'destructive', onPress: () => void doDeleteMedia(m) },
+      { text: '취소', style: 'cancel' },
+    ])
+  }
+
+  const handleDeleteMedia = (m: Media) => {
+    Alert.alert('사진 삭제', '이 사진을 삭제할까요?', [
+      { text: '취소', style: 'cancel' },
+      { text: '삭제', style: 'destructive', onPress: () => void doDeleteMedia(m) },
+    ])
+  }
+
+  const selectLayout = (t: PhotoLayoutType) => {
+    animateLayout()
+    setLayoutType(t)
+    setLayoutPickerVisible(false)
+    if (currentId) {
+      void AsyncStorage.setItem(LAYOUT_STORAGE_PREFIX + currentId, t).catch(() => {})
+    }
+  }
+
+  // 수정완료: 최소 100ms 스피너 + 최신 데이터 재로드 후 수정 모드 종료 (part7 명세)
+  const handleEditToggle = async () => {
+    if (!isEditing) {
+      if (!currentId) {
+        Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
+        return
+      }
+      animateLayout()
+      setIsEditing(true)
+      return
+    }
+    setEditLoading(true)
+    const started = Date.now()
+    try {
+      if (currentId) await load(currentId)
+    } finally {
+      const remain = 100 - (Date.now() - started)
+      if (remain > 0) await new Promise((r) => setTimeout(r, remain))
+      animateLayout()
+      setIsEditing(false)
+      setEditLoading(false)
+      showInterstitial()
+    }
+  }
+
+  const handleCall = () => {
+    const phone = placeDetails?.internationalPhoneNumber
+    if (phone) {
+      Linking.openURL(`tel:${phone.replace(/[^+\d]/g, '')}`).catch(() => {})
+    } else {
+      Alert.alert('통화', '전화번호 정보가 없습니다')
     }
   }
 
@@ -458,35 +793,216 @@ export function PlaceDetailSheet({
     Alert.alert(featureName, UNSUPPORTED_MSG)
   }
 
-  const tabs = ['개요', '메뉴', '리뷰', '사진', '업데이트', '정보']
+  const openViewer = (index: number) => {
+    setViewerIndex(index)
+    setViewerVisible(true)
+  }
+
+  const viewerGoTo = (index: number) => {
+    if (index < 0 || index >= media.length) return
+    viewerListRef.current?.scrollToIndex({ index, animated: true })
+    setViewerIndex(index)
+  }
+
+  const renderStars = (rating: number) => {
+    const filled = Math.round(rating)
+    return (
+      <View style={styles.starsRow}>
+        {[...Array(5)].map((_, i) => (
+          <Image
+            key={i}
+            source={
+              i < filled
+                ? require('../../assets/icons/star-filled.png')
+                : require('../../assets/icons/star-empty.png')
+            }
+            style={styles.starIcon}
+          />
+        ))}
+      </View>
+    )
+  }
+
+  // slot index → 해당 sort_order 의 media
+  const slotMedia = (slotIndex: number): Media | null =>
+    media.find((m) => m.sort_order === slotIndex) ?? null
+
+  // slot 내용물: 영상이면 인라인 자동재생, 사진이면 이미지.
+  // 영상 재생 소스 없으면 (로컬 소실 + 미공유) 포스터 썸네일로 fallback
+  const renderSlotContent = (m: Media) => {
+    if (m.media_type === 'video') {
+      const v = videoUri(m)
+      if (v) {
+        // pointerEvents none — 탭은 바깥 Pressable이 받음
+        return (
+          <View style={styles.videoFill} pointerEvents="none">
+            <SlotVideo uri={v} />
+          </View>
+        )
+      }
+    }
+    const uri = photoUri(m)
+    return uri ? <Image source={{ uri }} style={styles.photoImage} /> : null
+  }
+
+  const renderSlot = (slotIndex: number, style: object, editing: boolean) => {
+    const m = slotMedia(slotIndex)
+
+    if (!editing) {
+      if (!m) {
+        // 보기 모드 빈 slot: 레이아웃 형태 유지용 muted box (버튼 아님)
+        return <View key={slotIndex} style={[style, styles.slotEmptyView]} />
+      }
+      const mediaIndex = media.findIndex((x) => x.id === m.id)
+      return (
+        <Pressable key={slotIndex} style={style} onPress={() => openViewer(Math.max(0, mediaIndex))}>
+          {renderSlotContent(m)}
+        </Pressable>
+      )
+    }
+
+    if (!m) {
+      return (
+        <Pressable
+          key={slotIndex}
+          style={[style, styles.slotEmptyEdit]}
+          onPress={() => handleAddToSlot(slotIndex)}
+          disabled={mediaBusy}
+        >
+          {mediaBusy ? (
+            <ActivityIndicator size="small" />
+          ) : (
+            <>
+              <Image source={require('../../assets/icons/camera.png')} style={styles.editAddIconImg} />
+              <Text style={styles.editAddLabel}>사진 추가</Text>
+            </>
+          )}
+        </Pressable>
+      )
+    }
+
+    return (
+      <Pressable
+        key={slotIndex}
+        style={style}
+        onPress={() => handleFilledSlotPress(m, slotIndex)}
+        disabled={mediaBusy}
+      >
+        {renderSlotContent(m)}
+        <Pressable style={styles.editDeleteBtn} onPress={() => handleDeleteMedia(m)} disabled={mediaBusy}>
+          <Text style={styles.editDeleteText}>✕</Text>
+        </Pressable>
+      </Pressable>
+    )
+  }
+
+  const renderLayoutGrid = (editing: boolean) => {
+    const cell = (i: number, style: object) => renderSlot(i, style, editing)
+    switch (layoutType) {
+      case 'single':
+        return <View style={styles.gridSingle}>{cell(0, styles.gridFill)}</View>
+      case 'twoVertical':
+        return (
+          <View style={styles.gridTwoVertical}>
+            {cell(0, styles.gridFill)}
+            {cell(1, styles.gridFill)}
+          </View>
+        )
+      case 'twoHorizontal':
+        return (
+          <View style={styles.gridStack}>
+            {cell(0, styles.gridRowH190)}
+            {cell(1, styles.gridRowH190)}
+          </View>
+        )
+      case 'threeLeftHero':
+        return (
+          <View style={styles.gridThreeSide}>
+            {cell(0, styles.gridHeroCol)}
+            <View style={styles.gridSideCol}>
+              {cell(1, styles.gridFill)}
+              {cell(2, styles.gridFill)}
+            </View>
+          </View>
+        )
+      case 'threeRightHero':
+        return (
+          <View style={styles.gridThreeSide}>
+            <View style={styles.gridSideCol}>
+              {cell(1, styles.gridFill)}
+              {cell(2, styles.gridFill)}
+            </View>
+            {cell(0, styles.gridHeroCol)}
+          </View>
+        )
+      case 'threeTopHero':
+        return (
+          <View style={styles.gridStack}>
+            {cell(0, styles.gridRowH210)}
+            <View style={styles.gridRowPair150}>
+              {cell(1, styles.gridFill)}
+              {cell(2, styles.gridFill)}
+            </View>
+          </View>
+        )
+      case 'threeBottomHero':
+        return (
+          <View style={styles.gridStack}>
+            <View style={styles.gridRowPair160}>
+              {cell(1, styles.gridFill)}
+              {cell(2, styles.gridFill)}
+            </View>
+            {cell(0, styles.gridRowH210)}
+          </View>
+        )
+    }
+  }
+
+  const renderViewPhotos = () => {
+    if (media.length === 0) {
+      // 보기 모드 placeholder (part5 명세 — 편집 버튼 아님, 안내만)
+      return (
+        <View style={styles.photoEmpty}>
+          <Image source={require('../../assets/icons/camera.png')} style={styles.photoEmptyIconImg} />
+          <Text style={styles.photoEmptyTitle}>아직 사진이 없습니다</Text>
+          <Text style={styles.photoEmptySub}>수정 버튼을 눌러 사진을 추가하세요</Text>
+        </View>
+      )
+    }
+    return <View style={styles.photoSection}>{renderLayoutGrid(false)}</View>
+  }
+
+  const renderEditPhotos = () => (
+    <View style={styles.photoSection}>
+      <Pressable style={styles.layoutSelectBtn} onPress={() => setLayoutPickerVisible(true)}>
+        <Text style={styles.layoutSelectText}>레이아웃 선택</Text>
+      </Pressable>
+      {renderLayoutGrid(true)}
+    </View>
+  )
+
+  const openNow = placeDetails?.regularOpeningHours?.openNow
+
+  // Collapsed: 헤더 + 액션 버튼만. 사진/탭바/영업시간/수정 버튼 숨김 (part2/7 명세)
+  const showBody = snapState !== 'collapsed'
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }} onPress={onClose} />
+    <Modal visible={visible} transparent animationType="none" onRequestClose={onClose}>
+      {/* 지도가 계속 보여야 하므로 어두운 overlay 없이 투명 영역만 둠 */}
+      <Pressable style={styles.backdrop} onPress={() => closeSheet()} />
       <Animated.View
         style={[
           styles.sheet,
           {
-            maxHeight: dragY.interpolate({
-              inputRange: [EXPANDED_DRAG, 0],
-              outputRange: ['92%', '88%'],
+            height: dragY.interpolate({
+              inputRange: [0, CLOSED_OFFSET],
+              outputRange: [EXPANDED_HEIGHT, 0],
               extrapolate: 'clamp',
             }),
-            transform: [
-              {
-                translateY: dragY.interpolate({
-                  inputRange: [0, 600],
-                  outputRange: [0, 600],
-                  extrapolateLeft: 'clamp',
-                }),
-              },
-            ],
           },
         ]}
-        ref={sheetRef}
         {...panResponder.panHandlers}
       >
-        {/* Drag Handle */}
         <View style={styles.dragHandleContainer}>
           <View style={styles.dragHandle} />
         </View>
@@ -496,683 +1012,924 @@ export function PlaceDetailSheet({
             <ActivityIndicator />
           </View>
         ) : (
-          <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
-            {/* Header */}
-            <View style={styles.headerContainer}>
-              <View style={styles.headerLeft}>
-                {/* Place Name */}
-                <Text style={styles.placeName} numberOfLines={2}>
-                  {placeName}
-                </Text>
-
-                {/* Subtitle */}
-                <Text style={styles.subtitle} numberOfLines={1}>
-                  {placeAddress || '주소 정보 없음'}
-                </Text>
-
-                {/* Rating Row */}
-                {placeDetails?.rating != null && (
-                  <View style={styles.ratingRow}>
-                    <Text style={styles.ratingNumber}>{placeDetails.rating.toFixed(1)}</Text>
-                    {[...Array(Math.round(placeDetails.rating))].map((_, i) => (
-                      <Text key={i} style={styles.starIcon}>
-                        ⭐
-                      </Text>
-                    ))}
-                    {placeDetails.userRatingCount != null && (
-                      <Text style={styles.reviewCount}>
-                        ({placeDetails.userRatingCount.toLocaleString()})
-                      </Text>
-                    )}
-                  </View>
-                )}
-
-                {/* Category */}
-                {placeDetails?.primaryTypeDisplayName?.text ? (
-                  <Text style={styles.category}>{placeDetails.primaryTypeDisplayName.text}</Text>
-                ) : null}
-
-                {/* Status */}
-                {placeDetails?.regularOpeningHours?.openNow != null && (
+          <>
+            <ScrollView style={styles.scrollArea} showsVerticalScrollIndicator={false}>
+              {/* Collapsed 높이 측정 대상: 헤더 + 액션 버튼 */}
+              <View onLayout={handleCollapsedContentLayout}>
+              {/* Header */}
+              <View style={styles.headerContainer}>
+                <View style={styles.headerLeft}>
                   <Text
-                    style={[
-                      styles.statusText,
-                      placeDetails.regularOpeningHours.openNow ? styles.statusOpen : styles.statusClosed,
-                    ]}
+                    style={[styles.placeName, snapState === 'collapsed' && styles.placeNameCollapsed]}
+                    numberOfLines={2}
                   >
-                    {placeDetails.regularOpeningHours.openNow ? '영업 중' : '영업 종료'}
+                    {placeName}
                   </Text>
-                )}
-              </View>
+                  {placeAddress ? (
+                    <Text style={styles.subtitle} numberOfLines={2}>
+                      {placeAddress}
+                    </Text>
+                  ) : null}
 
-              {/* Header Icon Buttons */}
-              <View style={styles.headerIconsContainer}>
-                <Pressable
-                  style={[styles.headerIconBtn, isSaved && styles.headerIconBtnActive]}
-                  onPress={handleSave}
-                >
-                  <Image
-                    source={isSaved ? require('../../assets/icons/bookmark-check.png') : require('../../assets/icons/bookmark.png')}
-                    style={styles.headerIcon}
-                  />
-                </Pressable>
+                  {placeDetails?.rating != null && (
+                    <View style={styles.ratingRow}>
+                      <Text style={styles.ratingNumber}>{placeDetails.rating.toFixed(1)}</Text>
+                      {renderStars(placeDetails.rating)}
+                      {placeDetails.userRatingCount != null && (
+                        <Text style={styles.reviewCount}>
+                          ({placeDetails.userRatingCount.toLocaleString()})
+                        </Text>
+                      )}
+                    </View>
+                  )}
 
-                <Pressable style={styles.headerIconBtn} onPress={() => handleUnsupported('공유')}>
-                  <Image source={require('../../assets/icons/share.png')} style={styles.headerIcon} />
-                </Pressable>
+                  {placeDetails?.primaryTypeDisplayName?.text ? (
+                    <Text style={styles.category}>{placeDetails.primaryTypeDisplayName.text}</Text>
+                  ) : null}
 
-                <Pressable style={styles.headerIconBtn} onPress={onClose}>
-                  <Image source={require('../../assets/icons/close.png')} style={styles.headerIcon} />
-                </Pressable>
-              </View>
-            </View>
-
-            {/* Action Buttons - Horizontal Scroll */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.actionButtonsScroll}
-              contentContainerStyle={styles.actionButtonsContainer}
-            >
-              <Pressable
-                style={[styles.actionBtn, styles.actionBtnPrimary]}
-                onPress={() => handleUnsupported('경로')}
-              >
-                <Image source={require('../../assets/icons/direction.png')} style={styles.actionIcon} />
-                <Text style={styles.actionBtnTextPrimary}>경로</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionBtn, styles.actionBtnSecondary]}
-                onPress={() => handleUnsupported('시작')}
-              >
-                <Image source={require('../../assets/icons/navigate.png')} style={styles.actionIcon} />
-                <Text style={styles.actionBtnText}>시작</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionBtn, styles.actionBtnSecondary]}
-                onPress={handleCall}
-              >
-                <Image source={require('../../assets/icons/phone.png')} style={styles.actionIcon} />
-                <Text style={styles.actionBtnText}>통화</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionBtn, styles.actionBtnSecondary]}
-                onPress={handleSave}
-              >
-                <Image
-                  source={isSaved ? require('../../assets/icons/bookmark-check.png') : require('../../assets/icons/bookmark.png')}
-                  style={styles.actionIcon}
-                />
-                <Text style={styles.actionBtnText}>{isSaved ? '저장됨' : '저장'}</Text>
-              </Pressable>
-            </ScrollView>
-
-            {/* Photo Section */}
-            {!sheetExpanded && media.length > 0 && renderPhotoLayout()}
-
-            {sheetExpanded ? (
-              <View style={styles.photoGridContainer}>
-                <View style={styles.photoGrid}>
-                  {media.length > 0 ? (
-                    <>
-                      {media.map((m) => {
-                        const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
-                        return uri ? (
-                          <View key={m.id} style={styles.photoGridItem}>
-                            <Image source={{ uri }} style={styles.photoImage} />
-                          </View>
-                        ) : null
-                      })}
-                      {[...Array(Math.max(1, 3 - media.length))].map((_, i) => (
-                        <Pressable
-                          key={`extra-${i}`}
-                          style={styles.photoGridItem}
-                          onPress={handleAddMedia}
-                        >
-                          <View style={styles.photoAddPlaceholder}>
-                            <Text style={styles.photoAddIcon}>📷</Text>
-                            <Text style={styles.photoAddLabel}>추가</Text>
-                          </View>
-                        </Pressable>
-                      ))}
-                    </>
-                  ) : (
-                    <>
-                      {[...Array(6)].map((_, i) => (
-                        <Pressable
-                          key={`new-${i}`}
-                          style={styles.photoGridItem}
-                          onPress={handleAddMedia}
-                        >
-                          <View style={styles.photoAddPlaceholder}>
-                            <Text style={styles.photoAddIcon}>📷</Text>
-                            <Text style={styles.photoAddLabel}>추가</Text>
-                          </View>
-                        </Pressable>
-                      ))}
-                    </>
+                  {openNow != null && (
+                    <Text style={[styles.statusText, openNow ? styles.statusOpen : styles.statusClosed]}>
+                      {openNow ? '영업 중' : '영업 종료'}
+                    </Text>
                   )}
                 </View>
+
+                <View style={styles.headerIconsContainer}>
+                  <Pressable
+                    style={[styles.headerIconBtn, isSaved && currentId != null && styles.headerIconBtnActive]}
+                    onPress={handleSave}
+                    disabled={saving}
+                  >
+                    <Image
+                      source={
+                        isSaved && currentId != null
+                          ? require('../../assets/icons/bookmark-check.png')
+                          : require('../../assets/icons/bookmark.png')
+                      }
+                      style={[styles.headerIcon, isSaved && currentId != null && styles.headerIconActive]}
+                    />
+                  </Pressable>
+                  <Pressable style={styles.headerIconBtn} onPress={() => handleUnsupported('공유')}>
+                    <Image source={require('../../assets/icons/share.png')} style={styles.headerIcon} />
+                  </Pressable>
+                  <Pressable style={styles.headerIconBtn} onPress={() => closeSheet()}>
+                    <Image source={require('../../assets/icons/close.png')} style={styles.headerIcon} />
+                  </Pressable>
+                </View>
               </View>
-            ) : (
+
+              {/* Action buttons */}
               <ScrollView
+                ref={actionScrollRef}
                 horizontal
                 showsHorizontalScrollIndicator={false}
-                style={styles.photoStripScroll}
-                contentContainerStyle={styles.photoStripContainer}
+                style={styles.actionButtonsScroll}
+                contentContainerStyle={styles.actionButtonsContainer}
               >
-                {media.length > 0 ? (
-                  <>
-                    {media.map((m) => {
-                      const uri = resolveMediaUri(m.thumbnail_512 ?? m.storage_path)
-                      return uri ? (
-                        <View key={m.id} style={styles.photoItem}>
-                          <Image source={{ uri }} style={styles.photoImage} />
-                        </View>
-                      ) : null
-                    })}
-                    {[...Array(Math.max(1, 3 - media.length))].map((_, i) => (
-                      <Pressable
-                        key={`extra-${i}`}
-                        style={styles.photoItem}
-                        onPress={handleAddMedia}
-                      >
-                        <View style={styles.photoAddPlaceholder}>
-                          <Text style={styles.photoAddIcon}>📷</Text>
-                          <Text style={styles.photoAddLabel}>사진 드래그</Text>
-                          <Text style={styles.photoAddSubLabel}>or browse files</Text>
-                        </View>
-                      </Pressable>
-                    ))}
-                  </>
-                ) : (
-                  <>
-                    {[...Array(3)].map((_, i) => (
-                      <Pressable
-                        key={`new-${i}`}
-                        style={styles.photoItem}
-                        onPress={handleAddMedia}
-                      >
-                        <View style={styles.photoAddPlaceholder}>
-                          <Text style={styles.photoAddIcon}>📷</Text>
-                          <Text style={styles.photoAddLabel}>사진 드래그</Text>
-                          <Text style={styles.photoAddSubLabel}>or browse files</Text>
-                        </View>
-                      </Pressable>
-                    ))}
-                  </>
-                )}
-              </ScrollView>
-            )}
-
-            {/* Tab Bar */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.tabBarScroll}
-              contentContainerStyle={styles.tabBarContainer}
-            >
-              {tabs.map((tab, idx) => (
                 <Pressable
-                  key={tab}
-                  style={styles.tabItem}
-                  onPress={() => setActiveTab(idx)}
+                  style={[styles.actionBtn, styles.actionBtnPrimary]}
+                  onPress={() => handleUnsupported('경로')}
                 >
-                  <Text style={[styles.tabText, activeTab === idx && styles.tabTextActive]}>
-                    {tab}
-                  </Text>
-                  {activeTab === idx && <View style={styles.tabUnderline} />}
+                  <Image source={require('../../assets/icons/direction.png')} style={styles.actionIcon} />
+                  <Text style={styles.actionBtnTextPrimary}>경로</Text>
                 </Pressable>
-              ))}
+                <Pressable
+                  style={[styles.actionBtn, styles.actionBtnSecondary]}
+                  onPress={() => handleUnsupported('시작')}
+                >
+                  <Image source={require('../../assets/icons/navigate.png')} style={styles.actionIcon} />
+                  <Text style={styles.actionBtnText}>시작</Text>
+                </Pressable>
+                <Pressable style={[styles.actionBtn, styles.actionBtnSecondary]} onPress={handleCall}>
+                  <Image source={require('../../assets/icons/phone.png')} style={styles.actionIcon} />
+                  <Text style={styles.actionBtnText}>통화</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.actionBtn, styles.actionBtnSecondary]}
+                  onPress={handleSave}
+                  disabled={saving}
+                >
+                  <Image
+                    source={
+                      isSaved && currentId != null
+                        ? require('../../assets/icons/bookmark-check.png')
+                        : require('../../assets/icons/bookmark.png')
+                    }
+                    style={styles.actionIcon}
+                  />
+                  <Text style={styles.actionBtnText}>
+                    {isSaved && currentId != null ? '저장됨' : '저장'}
+                  </Text>
+                </Pressable>
+              </ScrollView>
+              </View>
+
+              {/* Collapsed에서는 여기 아래 전부 숨김 */}
+              {showBody && (
+                <>
+                  {/* Photo section: saved memory만 사진 표시 */}
+                  {currentId != null &&
+                    detail != null &&
+                    (isEditing ? renderEditPhotos() : renderViewPhotos())}
+
+                  {/* Tab bar */}
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.tabBarScroll}
+                    contentContainerStyle={styles.tabBarContainer}
+                  >
+                    {TABS.map((tab, idx) => (
+                      <Pressable key={tab} style={styles.tabItem} onPress={() => setActiveTab(idx)}>
+                        <Text style={[styles.tabText, activeTab === idx && styles.tabTextActive]}>
+                          {tab}
+                        </Text>
+                        {activeTab === idx && (
+                          <View style={styles.tabUnderline} pointerEvents="none" />
+                        )}
+                      </Pressable>
+                    ))}
+                  </ScrollView>
+
+                  {/* Hours card — 데이터 없으면 카드 자체 숨김 (part7 명세) */}
+                  {(placeDetails?.regularOpeningHours?.weekdayDescriptions?.length ?? 0) > 0 && (
+                    <View style={styles.hoursCard}>
+                      <Pressable
+                        style={styles.hoursHeader}
+                        onPress={() => {
+                          animateLayout()
+                          setHoursExpanded(!hoursExpanded)
+                        }}
+                      >
+                        <Image source={require('../../assets/icons/clock.png')} style={styles.infoIcon} />
+                        <Text style={styles.infoLabel}>영업시간</Text>
+                        <Image
+                          source={
+                            hoursExpanded
+                              ? require('../../assets/icons/chevron-up.png')
+                              : require('../../assets/icons/chevron-down.png')
+                          }
+                          style={styles.infoChevronIcon}
+                        />
+                      </Pressable>
+                      {hoursExpanded && (
+                        <View style={styles.hoursBody}>
+                          {placeDetails!.regularOpeningHours!.weekdayDescriptions!.map((line) => (
+                            <Text key={line} style={styles.hoursText}>
+                              {line}
+                            </Text>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+                  )}
+                </>
+              )}
+
+              <View style={styles.scrollBottomSpace} />
             </ScrollView>
 
-            {/* Business Hours Row */}
-            <Pressable
-              style={styles.infoRow}
-              onPress={() => {
-                animateLayout()
-                setHoursExpanded(!hoursExpanded)
-              }}
-            >
-              <View style={styles.infoIconContainer}>
-                <Image source={require('../../assets/icons/clock.png')} style={styles.infoIcon} />
-              </View>
-              <Text style={styles.infoLabel}>영업시간</Text>
-              <View style={styles.infoChevronContainer}>
-                <Image
-                  source={hoursExpanded ? require('../../assets/icons/chevron-down.png') : require('../../assets/icons/chevron-right.png')}
-                  style={styles.infoChevronIcon}
-                />
-              </View>
-            </Pressable>
-
-            {hoursExpanded && (
-              <View style={styles.hoursContent}>
-                <Text style={styles.hoursText}>
-                  {placeDetails?.regularOpeningHours?.weekdayDescriptions?.length
-                    ? placeDetails.regularOpeningHours.weekdayDescriptions.join('\n')
-                    : '영업시간 정보 없음'}
-                </Text>
+            {/* Edit / 수정완료 — Medium/Expanded 하단 상시, Collapsed에서만 숨김 */}
+            {showBody && (
+              <View style={styles.editButtonContainer}>
+                <Pressable
+                  style={[styles.editButton, isEditing && styles.editButtonActive]}
+                  onPress={() => void handleEditToggle()}
+                  disabled={editLoading}
+                >
+                  {editLoading ? (
+                    <ActivityIndicator size="small" color={COLORS.white} />
+                  ) : (
+                    <Text style={[styles.editButtonText, isEditing && styles.editButtonTextActive]}>
+                      {isEditing ? '수정완료' : '수정'}
+                    </Text>
+                  )}
+                </Pressable>
               </View>
             )}
-
-            {/* Edit Button */}
-            <View style={styles.editButtonContainer}>
-              <Pressable
-                style={[styles.editButton, isEditing && styles.editButtonActive, editLoading && styles.editButtonLoading]}
-                onPress={handleEditToggle}
-                disabled={editLoading}
-              >
-                {editLoading ? (
-                  <ActivityIndicator size="small" color={isEditing ? '#fff' : '#666'} />
-                ) : (
-                  <Text style={[styles.editButtonText, isEditing && { color: '#fff' }]}>
-                    {isEditing ? '수정완료' : '수정'}
-                  </Text>
-                )}
-              </Pressable>
-            </View>
-
-            <View style={{ height: 20 }} />
-          </ScrollView>
+          </>
         )}
       </Animated.View>
+
+      {/* Layout picker */}
+      <Modal
+        visible={layoutPickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setLayoutPickerVisible(false)}
+      >
+        <Pressable style={styles.pickerBackdrop} onPress={() => setLayoutPickerVisible(false)}>
+          <Pressable style={styles.pickerCard} onPress={() => {}}>
+            <Text style={styles.pickerTitle}>레이아웃 선택</Text>
+            <View style={styles.pickerGrid}>
+              {LAYOUT_OPTIONS.map((opt) => (
+                <Pressable
+                  key={opt.type}
+                  style={[styles.pickerOption, layoutType === opt.type && styles.pickerOptionActive]}
+                  onPress={() => selectLayout(opt.type)}
+                >
+                  <LayoutPreviewThumb type={opt.type} />
+                  <Text
+                    style={[
+                      styles.pickerOptionLabel,
+                      layoutType === opt.type && styles.pickerOptionLabelActive,
+                    ]}
+                  >
+                    {opt.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* 저장 목록 선택 */}
+      <Modal
+        visible={savePickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSavePickerVisible(false)}
+      >
+        <Pressable style={styles.pickerBackdrop} onPress={() => setSavePickerVisible(false)}>
+          <Pressable style={styles.pickerCard} onPress={() => {}}>
+            <Text style={styles.pickerTitle}>저장할 목록</Text>
+
+            <Pressable style={styles.listRow} onPress={() => void saveToList(null)}>
+              <View style={[styles.listDot, styles.listDotNone]} />
+              <Text style={styles.listRowText}>목록 없이 저장</Text>
+            </Pressable>
+
+            {saveLists.map((list) => (
+              <Pressable key={list.id} style={styles.listRow} onPress={() => void saveToList(list.id)}>
+                <View style={[styles.listDot, { backgroundColor: list.color }]} />
+                <Text style={styles.listRowText}>{list.name}</Text>
+              </Pressable>
+            ))}
+
+            <View style={styles.listCreateDivider} />
+            <Text style={styles.listCreateLabel}>새 목록 만들기</Text>
+            <TextInput
+              style={styles.listNameInput}
+              placeholder="목록 이름"
+              placeholderTextColor="#9AA0A6"
+              value={newListName}
+              onChangeText={setNewListName}
+              maxLength={30}
+            />
+            <View style={styles.colorRow}>
+              {LIST_COLORS.map((c) => (
+                <Pressable
+                  key={c}
+                  style={[
+                    styles.colorSwatch,
+                    { backgroundColor: c },
+                    newListColor === c && styles.colorSwatchActive,
+                  ]}
+                  onPress={() => setNewListColor(c)}
+                />
+              ))}
+            </View>
+            <Pressable
+              style={[styles.listCreateBtn, !newListName.trim() && styles.listCreateBtnDisabled]}
+              onPress={() => void handleCreateList()}
+              disabled={!newListName.trim()}
+            >
+              <Text style={styles.listCreateBtnText}>만들고 저장</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Fullscreen photo viewer */}
+      <Modal
+        visible={viewerVisible}
+        animationType="fade"
+        onRequestClose={() => setViewerVisible(false)}
+      >
+        <View style={styles.viewerContainer}>
+          <View style={styles.viewerTopBar}>
+            <Pressable style={styles.viewerCloseBtn} onPress={() => setViewerVisible(false)}>
+              <Text style={styles.viewerCloseText}>✕</Text>
+            </Pressable>
+            <Text style={styles.viewerCounter}>
+              {viewerIndex + 1} / {media.length}
+            </Text>
+          </View>
+
+          <FlatList
+            ref={viewerListRef}
+            data={media}
+            extraData={viewerIndex}
+            horizontal
+            pagingEnabled
+            showsHorizontalScrollIndicator={false}
+            keyExtractor={(m) => m.id}
+            initialScrollIndex={viewerIndex}
+            getItemLayout={(_, index) => ({
+              length: SCREEN_WIDTH,
+              offset: SCREEN_WIDTH * index,
+              index,
+            })}
+            onScrollToIndexFailed={({ index }) => {
+              setTimeout(() => {
+                viewerListRef.current?.scrollToIndex({ index, animated: false })
+              }, 100)
+            }}
+            onMomentumScrollEnd={(e) => {
+              const idx = Math.round(e.nativeEvent.contentOffset.x / SCREEN_WIDTH)
+              setViewerIndex(Math.max(0, Math.min(media.length - 1, idx)))
+            }}
+            renderItem={({ item, index }) => {
+              if (item.media_type === 'video') {
+                const v = videoUri(item)
+                const poster = photoUri(item)
+                return (
+                  <View style={styles.viewerPage}>
+                    {v ? (
+                      <ViewerVideo uri={v} active={index === viewerIndex} />
+                    ) : poster ? (
+                      <Image source={{ uri: poster }} style={styles.viewerImage} resizeMode="contain" />
+                    ) : null}
+                  </View>
+                )
+              }
+              const uri = localUris[item.id] ?? fullUri(item)
+              return (
+                <View style={styles.viewerPage}>
+                  {uri ? (
+                    <Image source={{ uri }} style={styles.viewerImage} resizeMode="contain" />
+                  ) : null}
+                </View>
+              )
+            }}
+          />
+
+          {/* 좌우 화살표 — 사진 영역 좌우 가장자리 중앙 overlay */}
+          <Pressable
+            style={[
+              styles.viewerArrowBtn,
+              styles.viewerArrowLeft,
+              viewerIndex <= 0 && styles.viewerArrowDisabled,
+            ]}
+            onPress={() => viewerGoTo(viewerIndex - 1)}
+            disabled={viewerIndex <= 0}
+          >
+            <Text style={styles.viewerArrowText}>‹</Text>
+          </Pressable>
+          <Pressable
+            style={[
+              styles.viewerArrowBtn,
+              styles.viewerArrowRight,
+              viewerIndex >= media.length - 1 && styles.viewerArrowDisabled,
+            ]}
+            onPress={() => viewerGoTo(viewerIndex + 1)}
+            disabled={viewerIndex >= media.length - 1}
+          >
+            <Text style={styles.viewerArrowText}>›</Text>
+          </Pressable>
+        </View>
+      </Modal>
     </Modal>
   )
 }
 
 const styles = StyleSheet.create({
-  sheet: {
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    maxHeight: '88%',
+  backdrop: {
     flex: 1,
+    backgroundColor: 'transparent',
   },
-  sheetExpanded: {
-    maxHeight: '92%',
+  sheet: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: COLORS.white,
+    borderTopLeftRadius: SHEET_RADIUS,
+    borderTopRightRadius: SHEET_RADIUS,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    elevation: 14,
+    overflow: 'hidden',
   },
   dragHandleContainer: {
     alignItems: 'center',
-    paddingTop: 8,
-    paddingBottom: 3,
   },
   dragHandle: {
-    width: 36,
-    height: 4,
-    backgroundColor: '#C7C7CC',
-    borderRadius: 2,
+    width: 54,
+    height: 5,
+    backgroundColor: '#C8C8C8',
+    borderRadius: 999,
+    marginTop: 10,
+    marginBottom: 12,
   },
   center: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
+  scrollArea: {
+    flex: 1,
+  },
+  scrollBottomSpace: {
+    height: 20,
+  },
 
   // HEADER
   headerContainer: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    gap: 10,
-    paddingHorizontal: 16,
+    gap: SPACING.medium,
+    paddingHorizontal: SPACING.horizontal,
     paddingTop: 2,
-    paddingBottom: 12,
+    paddingBottom: SPACING.large,
     borderBottomWidth: 1,
-    borderBottomColor: '#E8EAED',
+    borderBottomColor: COLORS.border,
   },
   headerLeft: {
     flex: 1,
     minWidth: 0,
   },
   placeName: {
-    fontSize: 21,
+    fontSize: HEADER.titleSizeExpanded,
     fontWeight: '700',
-    color: '#1a1a1a',
+    color: COLORS.textDark,
     letterSpacing: -0.4,
-    lineHeight: 25,
+    lineHeight: HEADER.lineHeightTitle,
+  },
+  placeNameCollapsed: {
+    fontSize: HEADER.titleSizeCollapsed,
+    lineHeight: 28,
   },
   subtitle: {
-    fontSize: 12.5,
-    color: '#70757A',
-    lineHeight: 17,
+    fontSize: HEADER.subtitleSize,
+    color: COLORS.textGray,
+    lineHeight: HEADER.lineHeightSubtitle,
     marginTop: 2,
   },
   ratingRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 2,
-    marginTop: 4,
+    gap: 6,
+    marginTop: 6,
     flexWrap: 'wrap',
   },
   ratingNumber: {
-    fontWeight: '700',
-    color: '#1a1a1a',
-    fontSize: 12,
+    fontSize: HEADER.metaSize,
+    color: COLORS.textGray,
+  },
+  starsRow: {
+    flexDirection: 'row',
+    gap: 1,
   },
   starIcon: {
-    fontSize: 11,
+    width: 15,
+    height: 15,
+    resizeMode: 'contain',
   },
   reviewCount: {
-    fontSize: 12,
-    color: '#70757A',
-  },
-  separator: {
-    fontSize: 12,
-    color: '#70757A',
-    marginHorizontal: 2,
-  },
-  transitContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 2,
-    marginLeft: 4,
-  },
-  transitText: {
-    fontSize: 12,
-    color: '#70757A',
+    fontSize: HEADER.metaSize,
+    color: COLORS.textGray,
   },
   category: {
-    fontSize: 12.5,
-    color: '#70757A',
-    marginTop: 3,
+    fontSize: HEADER.metaSize,
+    color: COLORS.textGray,
+    marginTop: 4,
   },
   statusText: {
-    fontSize: 12.5,
+    fontSize: HEADER.metaSize,
     fontWeight: '500',
-    marginTop: 2,
+    marginTop: 4,
   },
   statusOpen: {
-    color: '#137333',
+    color: COLORS.open,
   },
   statusClosed: {
-    color: '#C62828',
-  },
-  statusClosing: {
-    color: '#EA8600',
+    color: COLORS.closed,
   },
 
-  // Header Icon Buttons
+  // HEADER ICON BUTTONS — 가로 배치 (저장이 앞)
   headerIconsContainer: {
-    flexDirection: 'column',
-    gap: 6,
+    flexDirection: 'row',
+    gap: SPACING.small,
   },
   headerIconBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    borderWidth: 1.5,
-    borderColor: '#E8EAED',
+    width: ICON_BUTTON.size,
+    height: ICON_BUTTON.size,
+    borderRadius: ICON_BUTTON.borderRadius,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#fff',
+    backgroundColor: '#F5F3F3',
   },
   headerIconBtnActive: {
-    backgroundColor: '#1C7B6C',
-    borderColor: '#1C7B6C',
+    backgroundColor: COLORS.primary,
   },
   headerIcon: {
     width: 17,
     height: 17,
     resizeMode: 'contain',
   },
+  headerIconActive: {
+    tintColor: COLORS.white,
+  },
 
   // ACTION BUTTONS
   actionButtonsScroll: {
-    paddingHorizontal: 16,
+    flexGrow: 0,
   },
   actionButtonsContainer: {
-    paddingVertical: 12,
-    gap: 8,
-    paddingBottom: 10,
+    paddingLeft: SPACING.medium,
+    paddingRight: SPACING.horizontal,
+    paddingVertical: SPACING.medium,
+    gap: ACTION_BUTTON.gap,
+    alignItems: 'center',
   },
   actionBtn: {
-    height: 50,
-    borderRadius: 25,
-    paddingHorizontal: 16,
+    height: ACTION_BUTTON.height,
+    borderRadius: ACTION_BUTTON.borderRadius,
+    paddingHorizontal: ACTION_BUTTON.paddingHorizontal,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
+    gap: 8,
   },
   actionBtnPrimary: {
-    backgroundColor: '#1C7B6C',
+    backgroundColor: COLORS.primary,
   },
   actionBtnSecondary: {
-    backgroundColor: '#D8EEE9',
+    backgroundColor: COLORS.primaryLight,
   },
   actionBtnTextPrimary: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.white,
+    lineHeight: 20,
+    includeFontPadding: false,
+    textAlignVertical: 'center',
   },
   actionBtnText: {
-    fontSize: 13,
+    fontSize: 16,
     fontWeight: '600',
-    color: '#1C7B6C',
+    color: COLORS.primaryDark,
+    lineHeight: 20,
+    includeFontPadding: false,
+    textAlignVertical: 'center',
   },
   actionIcon: {
-    width: 18,
-    height: 18,
+    width: 20,
+    height: 20,
     resizeMode: 'contain',
   },
 
-  // PHOTO STRIP
-  photoStripScroll: {
-    marginBottom: 12,
-  },
-  photoStripContainer: {
-    height: 250,
-    paddingHorizontal: 16,
-    gap: 3,
-  },
-  photoItem: {
-    width: 160,
-    height: 250,
-    borderRadius: 4,
-    overflow: 'hidden',
+  // PHOTO SECTION — 그리드는 화면 전체 너비 (Google Maps 스타일 edge-to-edge)
+  photoSection: {
+    marginBottom: SPACING.medium,
   },
   photoImage: {
     width: '100%',
     height: '100%',
     resizeMode: 'cover',
   },
-  photoAddPlaceholder: {
+  videoFill: {
     width: '100%',
     height: '100%',
-    backgroundColor: '#F0F0EE',
+  },
+  viewerVideo: {
+    width: SCREEN_WIDTH,
+    height: '100%',
+  },
+  photoEmpty: {
+    height: 220,
+    backgroundColor: COLORS.bgMuted,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 4,
-    borderWidth: 1,
-    borderColor: '#ccc',
+    gap: 4,
+    marginBottom: SPACING.medium,
+  },
+  photoEmptyIconImg: {
+    width: 34,
+    height: 34,
+    resizeMode: 'contain',
+    marginBottom: 2,
+  },
+  photoEmptyTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: COLORS.textLightGray,
+  },
+  photoEmptySub: {
+    fontSize: 13,
+    color: '#9AA0A6',
+  },
+
+  // 7종 레이아웃 그리드
+  gridFill: {
+    flex: 1,
+  },
+  gridSingle: {
+    height: 300,
+  },
+  gridTwoVertical: {
+    height: 260,
+    flexDirection: 'row',
+    gap: 3,
+  },
+  gridStack: {
+    gap: 3,
+  },
+  gridRowH190: {
+    height: 190,
+  },
+  gridRowH210: {
+    height: 210,
+  },
+  gridRowPair150: {
+    height: 150,
+    flexDirection: 'row',
+    gap: 3,
+  },
+  gridRowPair160: {
+    height: 160,
+    flexDirection: 'row',
+    gap: 3,
+  },
+  gridThreeSide: {
+    height: 360,
+    flexDirection: 'row',
+    gap: 3,
+  },
+  gridHeroCol: {
+    flex: 62,
+  },
+  gridSideCol: {
+    flex: 38,
+    gap: 3,
+  },
+
+  // slot 상태
+  slotEmptyView: {
+    backgroundColor: COLORS.bgMuted,
+  },
+  slotEmptyEdit: {
+    borderWidth: 1.5,
+    borderColor: '#C7C7CC',
     borderStyle: 'dashed',
+    backgroundColor: '#FAFAFA',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
   },
-  photoAddIcon: {
-    fontSize: 32,
-    marginBottom: 4,
+  editDeleteBtn: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: COLORS.closed,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  photoAddLabel: {
+  editDeleteText: {
+    color: COLORS.white,
     fontSize: 12,
-    color: '#999',
+    fontWeight: '700',
+    lineHeight: 14,
+  },
+  editAddIconImg: {
+    width: 26,
+    height: 26,
+    resizeMode: 'contain',
+  },
+  editAddLabel: {
+    fontSize: 12,
+    color: '#9AA0A6',
     fontWeight: '500',
   },
-  photoAddSubLabel: {
-    fontSize: 11,
-    color: '#bbb',
-    marginTop: 2,
-  },
 
-  // PHOTO GRID (Expanded)
-  photoGridContainer: {
-    flex: 1,
-    backgroundColor: '#fafafa',
+  // 레이아웃 선택 버튼 + 모달
+  layoutSelectBtn: {
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: COLORS.bgMuted,
     paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 12,
+    alignSelf: 'flex-start',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: SPACING.horizontal,
+    marginBottom: SPACING.small,
   },
-  photoGrid: {
+  layoutSelectText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLORS.textGray,
+  },
+  pickerBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pickerCard: {
+    width: '86%',
+    backgroundColor: COLORS.white,
+    borderRadius: 20,
+    padding: 20,
+  },
+  pickerTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: COLORS.textDark,
+    marginBottom: 16,
+  },
+  pickerGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
-    justifyContent: 'flex-start',
+    gap: 10,
   },
-  photoGridItem: {
-    width: '31%',
-    aspectRatio: 1,
-    borderRadius: 8,
-    overflow: 'hidden',
-    backgroundColor: '#fff',
-  },
-
-  // PHOTO LAYOUTS (Collapsed state)
-  photoLayoutSingle: {
-    height: 300,
-    marginHorizontal: 16,
-    marginBottom: 12,
+  pickerOption: {
+    width: '30%',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 10,
     borderRadius: 12,
-    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
-  photoLayoutSingleItem: {
-    width: '100%',
-    height: '100%',
+  pickerOptionActive: {
+    borderColor: COLORS.primary,
+    backgroundColor: COLORS.primaryLight,
   },
-  photoLayoutDouble: {
-    height: 300,
-    marginHorizontal: 16,
-    marginBottom: 12,
+  pickerOptionLabel: {
+    fontSize: 12,
+    color: COLORS.textGray,
+    fontWeight: '500',
   },
-  photoLayoutDoubleItem: {
-    height: 150,
-    borderRadius: 12,
-    overflow: 'hidden',
-    marginBottom: 6,
+  pickerOptionLabelActive: {
+    color: COLORS.primaryDark,
+    fontWeight: '700',
   },
-  photoLayoutDoubleH: {
-    height: 250,
-    marginHorizontal: 16,
-    marginBottom: 12,
+  pvFrame: {
+    width: 64,
+    height: 48,
+    gap: 2,
   },
-  photoLayoutDoubleHContainer: {
+  pvRow: {
     flexDirection: 'row',
-    gap: 6,
   },
-  photoLayoutDoubleHItem: {
-    width: 250,
-    height: 250,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  photoLayoutTriple: {
-    marginHorizontal: 16,
-    marginBottom: 12,
-    gap: 6,
-  },
-  photoLayoutTripleTop: {
-    height: 200,
-    borderRadius: 12,
-    overflow: 'hidden',
-    marginBottom: 6,
-  },
-  photoLayoutTripleBottom: {
-    flexDirection: 'row',
-    height: 140,
-    gap: 6,
-  },
-  photoLayoutTripleBottomItem: {
+  pvRowInner: {
     flex: 1,
-    borderRadius: 12,
-    overflow: 'hidden',
+    flexDirection: 'row',
+    gap: 2,
+  },
+  pvCol: {
+    flex: 1,
+    gap: 2,
+  },
+  pvBlock: {
+    flex: 1,
+    backgroundColor: '#C9CDD2',
+    borderRadius: 2,
+  },
+  pvHero: {
+    flex: 1.6,
   },
 
-  // PHOTO SELECTION & NAVIGATION
-  photoSelected: {
-    borderWidth: 3,
-    borderColor: '#1C7B6C',
-  },
-  photoNavOverlay: {
-    ...StyleSheet.absoluteFill,
+  // 저장 목록 선택 모달
+  listRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    backgroundColor: 'rgba(0,0,0,0.3)',
+    gap: 12,
+    paddingVertical: 12,
+  },
+  listDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+  },
+  listDotNone: {
+    backgroundColor: COLORS.white,
+    borderWidth: 2,
+    borderColor: '#C7C7CC',
+  },
+  listRowText: {
+    fontSize: 16,
+    color: COLORS.textDark,
+    fontWeight: '500',
+  },
+  listCreateDivider: {
+    height: 1,
+    backgroundColor: COLORS.border,
+    marginVertical: 12,
+  },
+  listCreateLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.textGray,
+    marginBottom: 8,
+  },
+  listNameInput: {
+    height: 44,
     borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    paddingHorizontal: 14,
+    fontSize: 15,
+    color: COLORS.textDark,
+    marginBottom: 12,
   },
-  photoNavBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(255,255,255,0.8)',
-    justifyContent: 'center',
+  colorRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 14,
+    flexWrap: 'wrap',
+  },
+  colorSwatch: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+  },
+  colorSwatchActive: {
+    borderWidth: 3,
+    borderColor: COLORS.textDark,
+  },
+  listCreateBtn: {
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: COLORS.primary,
     alignItems: 'center',
+    justifyContent: 'center',
   },
-  photoNavText: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#1a1a1a',
+  listCreateBtnDisabled: {
+    opacity: 0.4,
+  },
+  listCreateBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: COLORS.white,
   },
 
   // TAB BAR
   tabBarScroll: {
     marginTop: 4,
+    flexGrow: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
   },
   tabBarContainer: {
-    borderBottomWidth: 1.5,
-    borderBottomColor: '#E8EAED',
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingHorizontal: SPACING.small,
   },
   tabItem: {
-    paddingVertical: 11,
-    paddingHorizontal: 13,
+    height: 58,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
     position: 'relative',
   },
   tabText: {
-    fontSize: 13.5,
+    fontSize: 15,
     fontWeight: '500',
-    color: '#70757A',
+    color: '#3C4043',
     letterSpacing: -0.2,
   },
   tabTextActive: {
-    color: '#1C7B6C',
+    color: COLORS.primary,
     fontWeight: '700',
   },
+  // tabItem(column)의 alignItems:center 가 absolute 자식의 가로 위치를 중앙으로 잡아줌
   tabUnderline: {
     position: 'absolute',
-    bottom: -1.5,
-    left: 0,
-    right: 0,
-    height: 2.5,
-    backgroundColor: '#1C7B6C',
-    borderTopLeftRadius: 2,
-    borderTopRightRadius: 2,
+    bottom: 0,
+    width: 36,
+    height: 4,
+    borderTopLeftRadius: 999,
+    borderTopRightRadius: 999,
+    backgroundColor: COLORS.primary,
   },
 
-  // BUSINESS HOURS
-  infoRow: {
+  // HOURS CARD
+  hoursCard: {
+    backgroundColor: COLORS.cardBg,
+    borderRadius: 22,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+    marginHorizontal: SPACING.horizontal,
+    marginTop: SPACING.section,
+  },
+  hoursHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 14,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F1F3F4',
-  },
-  infoIconContainer: {
-    width: 20,
-    height: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
   },
   infoLabel: {
     flex: 1,
-    fontSize: 14,
+    fontSize: 16,
     fontWeight: '500',
-    color: '#1a1a1a',
-  },
-  infoChevronContainer: {
-    width: 17,
-    height: 17,
-    justifyContent: 'center',
-    alignItems: 'center',
+    color: COLORS.textDark,
   },
   infoIcon: {
     width: 20,
@@ -1184,44 +1941,109 @@ const styles = StyleSheet.create({
     height: 17,
     resizeMode: 'contain',
   },
-  hoursContent: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#fafafa',
+  hoursBody: {
+    marginTop: 12,
+    gap: 4,
   },
   hoursText: {
-    fontSize: 13,
-    color: '#666',
-    lineHeight: 20,
+    fontSize: 14,
+    color: COLORS.textGray,
+    lineHeight: 21,
   },
 
   // EDIT BUTTON
   editButtonContainer: {
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingTop: 12,
+    paddingBottom: 24,
     borderTopWidth: 1,
-    borderTopColor: '#E8EAED',
+    borderTopColor: COLORS.border,
+    backgroundColor: COLORS.white,
   },
   editButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 20,
-    backgroundColor: '#F0F0EE',
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: COLORS.bgMuted,
     alignItems: 'center',
     justifyContent: 'center',
   },
   editButtonActive: {
-    backgroundColor: '#1C7B6C',
-  },
-  editButtonLoading: {
-    opacity: 0.7,
+    backgroundColor: COLORS.primary,
   },
   editButtonText: {
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: '600',
     color: '#666',
   },
-  editButtonActiveText: {
-    color: '#fff',
+  editButtonTextActive: {
+    color: COLORS.white,
+  },
+
+  // FULLSCREEN VIEWER
+  viewerContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  viewerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingTop: 56,
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+  },
+  viewerCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.15)',
+  },
+  viewerCloseText: {
+    color: COLORS.white,
+    fontSize: 17,
+    fontWeight: '600',
+  },
+  viewerCounter: {
+    color: COLORS.white,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  viewerPage: {
+    width: SCREEN_WIDTH,
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerImage: {
+    width: SCREEN_WIDTH,
+    height: '100%',
+  },
+  viewerArrowBtn: {
+    position: 'absolute',
+    top: '50%',
+    marginTop: -22,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerArrowLeft: {
+    left: 16,
+  },
+  viewerArrowRight: {
+    right: 16,
+  },
+  viewerArrowDisabled: {
+    opacity: 0.3,
+  },
+  viewerArrowText: {
+    color: COLORS.white,
+    fontSize: 26,
+    fontWeight: '600',
+    lineHeight: 30,
   },
 })

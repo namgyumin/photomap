@@ -1,15 +1,31 @@
 import { decode } from 'base64-arraybuffer'
-import { readAsStringAsync } from 'expo-file-system/legacy'
+import {
+  copyAsync,
+  deleteAsync,
+  documentDirectory,
+  getInfoAsync,
+  makeDirectoryAsync,
+  readAsStringAsync,
+} from 'expo-file-system/legacy'
 import * as ImageManipulator from 'expo-image-manipulator'
 import * as ImagePicker from 'expo-image-picker'
+import * as MediaLibrary from 'expo-media-library'
+import * as VideoThumbnails from 'expo-video-thumbnails'
 import type { MediaType } from '../types/database'
 import { supabase } from './supabase'
 import { supabaseUrl } from './config'
 
 export const MAX_VIDEO_SECONDS = 10
 
+// 하이브리드 미디어 정책:
+// - 원본(사진/영상)은 유저 기기 사진 라이브러리에 그대로 (local_asset_id 참조)
+// - 서버엔 디스플레이용 썸네일(1280, thumbnail_512 컬럼) + 마커용(128)만 업로드
+// - 공유 시점에만 uploadOriginal 로 원본 업로드 → storage_path 채움
+export const DISPLAY_THUMB_WIDTH = 1280
+
 export interface PickedMedia {
   uri: string
+  assetId: string | null
   mediaType: MediaType
   durationSeconds: number | null
   width: number | null
@@ -20,7 +36,7 @@ export interface PickedMedia {
 }
 
 export interface UploadedMediaPaths {
-  storagePath: string
+  storagePath: string | null
   thumbnail128: string | null
   thumbnail512: string | null
 }
@@ -76,6 +92,7 @@ function assetToPickedMedia(asset: ImagePicker.ImagePickerAsset): PickedMedia {
   const exif = extractExif(asset)
   return {
     uri: asset.uri,
+    assetId: asset.assetId ?? null,
     mediaType: isVideo ? 'video' : 'photo',
     durationSeconds: isVideo ? durationSeconds : null,
     width: asset.width ?? null,
@@ -141,18 +158,7 @@ export async function pickMedia(): Promise<PickedMedia | null> {
     }
   }
 
-  const exif = extractExif(asset)
-
-  return {
-    uri: asset.uri,
-    mediaType: isVideo ? 'video' : 'photo',
-    durationSeconds: isVideo ? durationSeconds : null,
-    width: asset.width ?? null,
-    height: asset.height ?? null,
-    capturedAt: exif.capturedAt,
-    latitude: exif.latitude,
-    longitude: exif.longitude,
-  }
+  return assetToPickedMedia(asset)
 }
 
 function getMimeType(uri: string, mediaType: MediaType): string {
@@ -165,7 +171,7 @@ function getMimeType(uri: string, mediaType: MediaType): string {
 }
 
 async function uploadLocalFile(
-  bucket: 'visit-photos',
+  bucket: 'visit-photos' | 'avatars',
   path: string,
   uri: string,
   contentType: string
@@ -199,7 +205,8 @@ async function sanitizePhotoForUpload(localUri: string): Promise<string> {
   return result.uri
 }
 
-// 로컬 URI → Supabase Storage 업로드. 원본 + 사진 썸네일 경로 반환.
+// 하이브리드 업로드: 원본은 올리지 않고 썸네일만 서버에 저장.
+// thumbnail_512 컬럼에 1280px 디스플레이 썸네일을 넣음 (컬럼명은 legacy).
 export async function uploadMedia(
   userId: string,
   visitId: string,
@@ -207,30 +214,117 @@ export async function uploadMedia(
   mediaType: MediaType
 ): Promise<UploadedMediaPaths> {
   const now = Date.now()
-  const ext = mediaType === 'video' ? 'mp4' : 'jpg'
-  const storagePath = `${userId}/${visitId}/original/${now}.${ext}`
-  const sanitizedPhotoUri = mediaType === 'photo' ? await sanitizePhotoForUpload(localUri) : localUri
-  const mimeType = getMimeType(sanitizedPhotoUri, mediaType)
 
-  await uploadLocalFile('visit-photos', storagePath, sanitizedPhotoUri, mimeType)
-
+  // 썸네일 소스: 사진은 원본, 영상은 첫 프레임 포스터
+  let thumbSourceUri: string
   if (mediaType === 'video') {
-    return { storagePath, thumbnail128: null, thumbnail512: null }
+    const { uri } = await VideoThumbnails.getThumbnailAsync(localUri, { time: 0 })
+    thumbSourceUri = uri
+  } else {
+    thumbSourceUri = await sanitizePhotoForUpload(localUri)
   }
 
   const thumb128Path = `${userId}/${visitId}/thumbs/${now}_128.jpg`
-  const thumb512Path = `${userId}/${visitId}/thumbs/${now}_512.jpg`
-  const [thumb128Uri, thumb512Uri] = await Promise.all([
-    createPhotoThumbnail(sanitizedPhotoUri, 128),
-    createPhotoThumbnail(sanitizedPhotoUri, 512),
+  const displayThumbPath = `${userId}/${visitId}/thumbs/${now}_${DISPLAY_THUMB_WIDTH}.jpg`
+  const [thumb128Uri, displayThumbUri] = await Promise.all([
+    createPhotoThumbnail(thumbSourceUri, 128),
+    createPhotoThumbnail(thumbSourceUri, DISPLAY_THUMB_WIDTH),
   ])
 
   await Promise.all([
     uploadLocalFile('visit-photos', thumb128Path, thumb128Uri, 'image/jpeg'),
-    uploadLocalFile('visit-photos', thumb512Path, thumb512Uri, 'image/jpeg'),
+    uploadLocalFile('visit-photos', displayThumbPath, displayThumbUri, 'image/jpeg'),
   ])
 
-  return { storagePath, thumbnail128: thumb128Path, thumbnail512: thumb512Path }
+  return { storagePath: null, thumbnail128: thumb128Path, thumbnail512: displayThumbPath }
+}
+
+// 공유 시점 원본 업로드. storage_path 로 쓸 경로 반환.
+export async function uploadOriginal(
+  userId: string,
+  visitId: string,
+  localUri: string,
+  mediaType: MediaType
+): Promise<string> {
+  const now = Date.now()
+  const ext = mediaType === 'video' ? 'mp4' : 'jpg'
+  const storagePath = `${userId}/${visitId}/original/${now}.${ext}`
+  const sourceUri = mediaType === 'photo' ? await sanitizePhotoForUpload(localUri) : localUri
+  await uploadLocalFile('visit-photos', storagePath, sourceUri, getMimeType(sourceUri, mediaType))
+  return storagePath
+}
+
+// ============================================================
+// 영상 로컬 캐시
+// iOS 사진 라이브러리 asset URI(ph://)는 expo-video 가 재생 못 함
+// → 영상 추가 시점에 앱 문서 폴더로 복사해 file:// 로 재생 (10초 제한이라 용량 작음)
+// ============================================================
+
+const LOCAL_VIDEO_DIR = `${documentDirectory ?? ''}photomap-videos/`
+
+function localVideoPath(mediaId: string): string {
+  return `${LOCAL_VIDEO_DIR}${mediaId}.mp4`
+}
+
+export async function cacheVideoLocally(mediaId: string, sourceUri: string): Promise<void> {
+  await makeDirectoryAsync(LOCAL_VIDEO_DIR, { intermediates: true }).catch(() => {})
+  await copyAsync({ from: sourceUri, to: localVideoPath(mediaId) })
+}
+
+export async function localVideoUri(mediaId: string): Promise<string | null> {
+  try {
+    const info = await getInfoAsync(localVideoPath(mediaId))
+    return info.exists ? localVideoPath(mediaId) : null
+  } catch {
+    return null
+  }
+}
+
+export async function deleteLocalVideo(mediaId: string): Promise<void> {
+  await deleteAsync(localVideoPath(mediaId), { idempotent: true }).catch(() => {})
+}
+
+// local_asset_id → 렌더링/업로드 가능한 로컬 URI.
+// 갤러리에서 삭제됐거나 권한 없으면 null (호출부는 서버 썸네일 fallback).
+export async function resolveLocalAssetUri(assetId: string | null): Promise<string | null> {
+  if (!assetId) return null
+  try {
+    let perm = await MediaLibrary.getPermissionsAsync()
+    if (!perm.granted && perm.canAskAgain) {
+      perm = await MediaLibrary.requestPermissionsAsync()
+    }
+    if (!perm.granted) return null
+    const info = await MediaLibrary.getAssetInfoAsync(assetId)
+    return info?.localUri ?? info?.uri ?? null
+  } catch {
+    return null
+  }
+}
+
+// 프로필 사진: 정사각 크롭 선택 → 512px JPEG → avatars 버킷 업로드 → public URL 반환.
+export async function pickAndUploadAvatar(userId: string): Promise<string | null> {
+  const perm = await ImagePicker.requestMediaLibraryPermissionsAsync()
+  if (!perm.granted) throw new Error('PERMISSION_DENIED')
+
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['images'],
+    allowsEditing: true,
+    aspect: [1, 1],
+    quality: 0.9,
+  })
+  if (result.canceled || !result.assets?.length) return null
+
+  const resized = await ImageManipulator.manipulateAsync(
+    result.assets[0].uri,
+    [{ resize: { width: 512 } }],
+    { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+  )
+
+  const path = `${userId}/avatar_${Date.now()}.jpg`
+  await uploadLocalFile('avatars', path, resized.uri, 'image/jpeg')
+
+  const { data } = supabase.storage.from('avatars').getPublicUrl(path)
+  return data.publicUrl
 }
 
 // storage_path → 렌더링 가능한 URI 해석.

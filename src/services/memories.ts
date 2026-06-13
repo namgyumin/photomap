@@ -1,4 +1,10 @@
-import { MAX_VIDEO_SECONDS } from '../lib/media'
+import {
+  deleteLocalVideo,
+  localVideoUri,
+  MAX_VIDEO_SECONDS,
+  resolveLocalAssetUri,
+  uploadOriginal,
+} from '../lib/media'
 import { supabase } from '../lib/supabase'
 import type {
   ImportMode,
@@ -9,10 +15,53 @@ import type {
   MemoryListItem,
   Place,
   PlaceLatLng,
+  SavedList,
   ShareLink,
   SharedMemory,
   Visibility,
 } from '../types/database'
+
+// ============================================================
+// saved lists (저장 목록)
+// ============================================================
+
+export async function listSavedLists(): Promise<SavedList[]> {
+  const { data: auth } = await supabase.auth.getUser()
+  if (!auth.user?.id) throw new Error('not authenticated')
+  const { data, error } = await supabase
+    .from('saved_lists')
+    .select('*')
+    .order('created_at', { ascending: true })
+  if (error) throw error
+  return (data ?? []) as SavedList[]
+}
+
+export async function createSavedList(name: string, color: string): Promise<SavedList> {
+  const { data: auth } = await supabase.auth.getUser()
+  const userId = auth.user?.id
+  if (!userId) throw new Error('not authenticated')
+  const { data, error } = await supabase
+    .from('saved_lists')
+    .insert({ user_id: userId, name, color })
+    .select('*')
+    .single()
+  if (error) throw error
+  return data as SavedList
+}
+
+export async function deleteSavedList(listId: string): Promise<void> {
+  const { error } = await supabase.from('saved_lists').delete().eq('id', listId)
+  if (error) throw error
+}
+
+export async function deleteListIfEmpty(listId: string): Promise<void> {
+  const { count, error } = await supabase
+    .from('visits')
+    .select('id', { count: 'exact', head: true })
+    .eq('saved_list_id', listId)
+  if (error) throw error
+  if ((count ?? 0) === 0) await deleteSavedList(listId)
+}
 
 // ============================================================
 // places
@@ -50,6 +99,7 @@ export interface CreateVisitMemoryInput {
   amountSpent?: number | null
   visibility?: Visibility
   isSaved?: boolean
+  savedListId?: string | null
 }
 
 export async function createVisitMemory(input: CreateVisitMemoryInput): Promise<Memory> {
@@ -64,6 +114,7 @@ export async function createVisitMemory(input: CreateVisitMemoryInput): Promise<
     note: input.note ?? null,
     amount_spent: input.amountSpent ?? null,
     is_saved: input.isSaved ?? true,
+    saved_list_id: input.savedListId ?? null,
   }
   if (input.visitedAt) row.visited_at = input.visitedAt
 
@@ -82,6 +133,7 @@ export interface UpdateVisitMemoryFields {
   amountSpent?: number | null
   visibility?: Visibility
   isSaved?: boolean
+  savedListId?: string | null
 }
 
 export async function updateVisitMemoryFields(
@@ -94,6 +146,7 @@ export async function updateVisitMemoryFields(
   if (fields.amountSpent !== undefined) patch.amount_spent = fields.amountSpent
   if (fields.visibility !== undefined) patch.visibility = fields.visibility
   if (fields.isSaved !== undefined) patch.is_saved = fields.isSaved
+  if (fields.savedListId !== undefined) patch.saved_list_id = fields.savedListId
 
   const { data, error } = await supabase
     .from('visits')
@@ -122,7 +175,8 @@ export async function setHeroMedia(memoryId: string, mediaId: string): Promise<M
 
 export interface AddMediaInput {
   visitId: string
-  storagePath: string
+  storagePath?: string | null // 하이브리드: 평소 null, 공유 후 원본 경로
+  localAssetId?: string | null // 기기 사진 라이브러리 asset 참조
   mediaType?: MediaType // 기본 photo
   durationSeconds?: number | null // video 만, 최대 10
   thumbnail128?: string | null
@@ -171,7 +225,8 @@ export async function addMediaToVisit(input: AddMediaInput): Promise<Media> {
     .insert({
       visit_id: input.visitId,
       uploader_id: userId,
-      storage_path: input.storagePath,
+      storage_path: input.storagePath ?? null,
+      local_asset_id: input.localAssetId ?? null,
       media_type: mediaType,
       duration_seconds: mediaType === 'video' ? input.durationSeconds : null,
       thumbnail_128: input.thumbnail128 ?? null,
@@ -215,6 +270,10 @@ export async function deleteMedia(media: Media): Promise<void> {
   const { error: dbErr } = await supabase.from('visit_photos').delete().eq('id', media.id)
   if (dbErr) throw dbErr
 
+  if (media.media_type === 'video') {
+    await deleteLocalVideo(media.id)
+  }
+
   if (paths.length > 0) {
     const { error: storageErr } = await supabase.storage.from('visit-photos').remove(paths)
     if (storageErr) throw storageErr
@@ -248,8 +307,9 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
   const { data, error } = await supabase
     .from('visits')
     .select(
-      `id, visited_at, note, amount_spent, hero_media_id,
-       place:places!visits_place_id_fkey(id, display_name, address, latitude, longitude),
+      `id, visited_at, note, amount_spent, hero_media_id, is_saved, saved_list_id,
+       saved_list:saved_lists!visits_saved_list_id_fkey(color),
+       place:places!visits_place_id_fkey(id, google_place_id, display_name, address, latitude, longitude),
        media:visit_photos!visit_photos_visit_id_fkey(id, thumbnail_512, storage_path, sort_order)`
     )
     .eq('user_id', userId)
@@ -262,8 +322,11 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
     note: string | null
     amount_spent: number | null
     hero_media_id: string | null
-    place: { id: string; display_name: string | null; address: string | null; latitude: number | null; longitude: number | null } | null
-    media: Array<{ id: string; thumbnail_512: string | null; storage_path: string; sort_order: number }>
+    is_saved: boolean
+    saved_list_id: string | null
+    saved_list: { color: string } | null
+    place: { id: string; google_place_id: string; display_name: string | null; address: string | null; latitude: number | null; longitude: number | null } | null
+    media: Array<{ id: string; thumbnail_512: string | null; storage_path: string | null; sort_order: number }>
   }>
 
   return rows.map((r) => {
@@ -278,9 +341,13 @@ export async function listMyMemories(): Promise<MemoryListItem[]> {
       note: r.note,
       amount_spent: r.amount_spent,
       hero_media_id: r.hero_media_id,
+      is_saved: r.is_saved,
+      saved_list_id: r.saved_list_id,
+      list_color: r.saved_list?.color ?? null,
       place: r.place
         ? {
             id: r.place.id,
+            google_place_id: r.place.google_place_id,
             display_name: r.place.display_name,
             address: r.place.address,
             latitude: r.place.latitude,
@@ -302,6 +369,8 @@ export interface MapMarker {
   latitude: number
   longitude: number
   heroThumbnail: string | null
+  isSaved: boolean
+  listColor: string | null
 }
 
 export async function loadMapMarkers(): Promise<MapMarker[]> {
@@ -315,6 +384,8 @@ export async function loadMapMarkers(): Promise<MapMarker[]> {
       latitude: m.place!.latitude!,
       longitude: m.place!.longitude!,
       heroThumbnail: m.hero?.thumbnail_512 ?? m.hero?.storage_path ?? null,
+      isSaved: m.is_saved,
+      listColor: m.list_color,
     }))
 }
 
@@ -356,10 +427,41 @@ export interface CreateShareLinkInput {
   expiresAt?: string | null
 }
 
+// 하이브리드: 공유 직전, 아직 서버에 원본 없는 미디어를 업로드해 storage_path 를 채움.
+// 로컬 asset 이 소실된 미디어는 건너뜀 (상대방은 서버 썸네일로 봄).
+export async function ensureOriginalsUploaded(visitId: string): Promise<void> {
+  const { data: auth } = await supabase.auth.getUser()
+  const userId = auth.user?.id
+  if (!userId) throw new Error('not authenticated')
+
+  const { data: rows, error } = await supabase
+    .from('visit_photos')
+    .select('*')
+    .eq('visit_id', visitId)
+    .is('storage_path', null)
+  if (error) throw error
+
+  for (const m of (rows ?? []) as Media[]) {
+    // 영상은 앱 로컬 캐시 우선 (ph:// 는 읽기/업로드 불가)
+    const localUri =
+      (m.media_type === 'video' ? await localVideoUri(m.id) : null) ??
+      (await resolveLocalAssetUri(m.local_asset_id))
+    if (!localUri) continue
+    const storagePath = await uploadOriginal(userId, visitId, localUri, m.media_type)
+    const { error: updateErr } = await supabase
+      .from('visit_photos')
+      .update({ storage_path: storagePath })
+      .eq('id', m.id)
+    if (updateErr) throw updateErr
+  }
+}
+
 export async function createShareLink(input: CreateShareLinkInput): Promise<ShareLink> {
   const { data: auth } = await supabase.auth.getUser()
   const userId = auth.user?.id
   if (!userId) throw new Error('not authenticated')
+
+  await ensureOriginalsUploaded(input.visitId)
 
   const { data, error } = await supabase
     .from('shared_links')
