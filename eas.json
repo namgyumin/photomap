@@ -4,6 +4,11 @@
     "appVersionSource": "remote"
   },
   "build": {
+    "base": {
+      "env": {
+        "NPM_CONFIG_LEGACY_PEER_DEPS": "true"
+      }
+    },
     "development": {
       "developmentClient": true,
       "distribution": "internal",
