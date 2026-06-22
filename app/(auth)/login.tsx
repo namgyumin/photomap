@@ -29,11 +29,6 @@ const SLIDES = [
     subtitle: '찍은 사진을 장소마다 모아두어요',
     emoji: '📸',
   },
-  {
-    title: '친구와\n기록을 공유해요',
-    subtitle: '내가 다녀온 곳을 링크로 쉽게 공유해요',
-    emoji: '🔗',
-  },
 ]
 
 export default function LoginScreen() {
@@ -162,7 +157,7 @@ export default function LoginScreen() {
   const handleGuestSignIn = () => {
     Alert.alert(
       '게스트로 시작할까요?',
-      '게스트 데이터는 로그아웃하는 순간 바로 삭제돼요.\n마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요.\n같은 게스트 계정으로 다시 로그인할 수 없어요.',
+      '게스트로 로그인 한 후에 Google로 연동 가능합니다.\n\n게스트 데이터는 로그아웃하는 순간 바로 삭제됩니다.\n\n연동하지 않으면 다시 로그인할 수 없어요.',
       [
         { text: '취소', style: 'cancel' },
         { text: '계속', onPress: () => void performGuestSignIn() },

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import Svg, { Circle, Path } from 'react-native-svg'
 import {
   ActivityIndicator,
   Alert,
@@ -88,6 +89,20 @@ function markerFromMapMarker(m: MapMarker): SavedMarker {
 }
 
 // 사진 있으면 사진 마커, 없으면 저장 목록 색상 점 마커
+function MapPin({ color = '#111111', size = 36 }: { color?: string; size?: number }) {
+  const w = size * 0.72
+  const h = size
+  return (
+    <Svg width={w} height={h} viewBox="0 0 36 50">
+      <Path
+        d="M18 0C8.06 0 0 8.06 0 18c0 13.5 18 32 18 32S36 31.5 36 18C36 8.06 27.94 0 18 0z"
+        fill={color}
+      />
+      <Circle cx="18" cy="18" r="8" fill="white" opacity={0.9} />
+    </Svg>
+  )
+}
+
 function SavedMarkerContent({ marker }: { marker: SavedMarker }) {
   const thumb = marker.place.heroPhotoUrl
   if (thumb) {
@@ -97,11 +112,7 @@ function SavedMarkerContent({ marker }: { marker: SavedMarker }) {
       </View>
     )
   }
-  return (
-    <View style={[styles.savedDot, { backgroundColor: marker.listColor ?? '#1C7B6C' }]}>
-      <View style={styles.savedDotInner} />
-    </View>
-  )
+  return <MapPin color={marker.listColor ?? '#111111'} size={36} />
 }
 
 export default function MapScreen() {
@@ -315,6 +326,7 @@ export default function MapScreen() {
         style={styles.map}
         initialRegion={initialRegionRef.current}
         showsUserLocation
+        showsMyLocationButton={false}
         onRegionChangeComplete={setCurrentRegion}
       >
         {savedMarkers.length > CLUSTER_THRESHOLD
@@ -383,22 +395,39 @@ export default function MapScreen() {
         </View>
       )}
 
-      {/* 검색바 */}
-      <View style={styles.searchBar}>
-        <TextInput
-          style={styles.searchInput}
-          placeholder="장소 검색"
-          value={query}
-          onChangeText={handleSearchInput}
-          onSubmitEditing={handleSearchSubmit}
-          returnKeyType="search"
-        />
-        <Pressable style={styles.searchBtn} onPress={handleSearchSubmit}>
-          {searching ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.searchBtnText}>검색</Text>
-          )}
+      {/* 검색바 + 내 위치 버튼 */}
+      <View style={styles.searchWrapper}>
+        <View style={styles.searchBar}>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="장소 검색"
+            value={query}
+            onChangeText={handleSearchInput}
+            onSubmitEditing={handleSearchSubmit}
+            returnKeyType="search"
+          />
+          <Pressable style={styles.searchBtn} onPress={handleSearchSubmit}>
+            {searching ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.searchBtnText}>검색</Text>
+            )}
+          </Pressable>
+        </View>
+        <Pressable
+          style={styles.myLocationBtn}
+          onPress={() => {
+            if (userLocation) {
+              mapRef.current?.animateToRegion({
+                latitude: userLocation.latitude,
+                longitude: userLocation.longitude,
+                latitudeDelta: 0.01,
+                longitudeDelta: 0.01,
+              }, 350)
+            }
+          }}
+        >
+          <Text style={styles.myLocationBtnText}>⊕</Text>
         </Pressable>
       </View>
 
@@ -428,6 +457,7 @@ export default function MapScreen() {
         searchPlace={sheetPlace}
         memoryId={sheetMemoryId}
         onSaved={handleSaved}
+        onDeleted={(memoryId) => setSavedMarkers((prev) => prev.filter((m) => m.memoryId !== memoryId))}
       />
     </SafeAreaView>
   )
@@ -478,13 +508,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   clusterText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-  searchBar: {
+  searchWrapper: {
     position: 'absolute',
     top: 50,
     left: 12,
     right: 12,
+    alignItems: 'flex-end',
+    gap: 5,
+  },
+  searchBar: {
     flexDirection: 'row',
     gap: 8,
+    width: '100%',
   },
   searchInput: {
     flex: 1,
@@ -506,9 +541,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   searchBtnText: { color: '#fff', fontWeight: '600' },
+  myLocationBtn: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  myLocationBtnText: {
+    fontSize: 32,
+    color: '#333',
+    includeFontPadding: false,
+    textShadowColor: 'rgba(0,0,0,0.3)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
   resultList: {
     position: 'absolute',
-    top: 104,
+    top: 155,
     left: 12,
     right: 12,
     backgroundColor: '#fff',

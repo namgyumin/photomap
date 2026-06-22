@@ -47,6 +47,9 @@ import {
   updateVisitMemoryFields,
 } from '../services/memories'
 import type { Media, MemoryDetail, SavedList, Visibility } from '../types/database'
+import { PhotoCropEditor } from './PhotoCropEditor'
+import { VideoTrimEditor } from './VideoTrimEditor'
+import { VideoPositionEditor } from './VideoPositionEditor'
 
 interface Props {
   visible: boolean
@@ -55,6 +58,7 @@ interface Props {
   searchPlace?: PlaceSearchResult | null
   memoryId?: string | null
   onSaved?: (memoryId: string, place: PlaceSearchResult) => void
+  onDeleted?: (memoryId: string) => void
   onChanged?: () => void
 }
 
@@ -347,6 +351,7 @@ export function PlaceDetailSheet({
   searchPlace,
   memoryId,
   onSaved,
+  onDeleted,
   onChanged,
 }: Props) {
   const { show: showInterstitial } = useInterstitialAd()
@@ -387,6 +392,16 @@ export function PlaceDetailSheet({
   const [layoutType, setLayoutType] = useState<PhotoLayoutType>('single')
   const [layoutPickerVisible, setLayoutPickerVisible] = useState(false)
   const [mediaBusy, setMediaBusy] = useState(false)
+  const [cropEditor, setCropEditor] = useState<{
+    uri: string; width: number; height: number; slotAspect: number; slotIndex: number
+  } | null>(null)
+  const [videoTrimEditor, setVideoTrimEditor] = useState<{
+    uri: string; duration: number; width: number; height: number; slotAspect: number; slotIndex: number
+  } | null>(null)
+  const [videoPositionEditor, setVideoPositionEditor] = useState<{
+    uri: string; trim: { startTime: number; endTime: number; duration: number }
+    width: number; height: number; slotAspect: number; slotIndex: number
+  } | null>(null)
 
   // Photo viewer
   const [viewerVisible, setViewerVisible] = useState(false)
@@ -573,6 +588,7 @@ export function PlaceDetailSheet({
             try {
               await deleteVisitMemory(currentId)
               if (listId) await deleteListIfEmpty(listId)
+              onDeleted?.(currentId)
               onChanged?.()
               onClose()
             } catch (e) {
@@ -642,19 +658,15 @@ export function PlaceDetailSheet({
     }
   }
 
-  // slot 단위 사진 선택→업로드→DB insert. sort_order = slotIndex 로 위치 영속.
-  const pickAndUploadToSlot = async (slotIndex: number): Promise<boolean> => {
-    if (!userId) {
-      Alert.alert('로그인 필요', '사진/영상을 추가하려면\n먼저 로그인해주세요.')
-      return false
-    }
-    if (!currentId) {
-      Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
-      return false
-    }
-    const picked = await pickMedia()
-    if (!picked) return false
-    const uploaded = await uploadMedia(userId, currentId, picked.uri, picked.mediaType)
+  const slotLayoutsRef = useRef<Record<number, { width: number; height: number }>>({})
+
+  const uploadPickedPhoto = async (
+    uri: string,
+    picked: Awaited<ReturnType<typeof pickMedia>>,
+    slotIndex: number
+  ): Promise<boolean> => {
+    if (!picked || !userId || !currentId) return false
+    const uploaded = await uploadMedia(userId, currentId, uri, picked.mediaType)
     const created = await addMediaToVisit({
       visitId: currentId,
       storagePath: uploaded.storagePath,
@@ -670,12 +682,61 @@ export function PlaceDetailSheet({
       longitude: picked.longitude,
       sortOrder: slotIndex,
     })
-    // 영상은 ph:// 재생 불가 → 앱 문서 폴더로 복사해 file:// 재생 (실패해도 추가 자체는 유지)
     if (picked.mediaType === 'video') {
       await cacheVideoLocally(created.id, picked.uri).catch(() => {})
     }
     return true
   }
+
+  // slot 단위 사진 선택→편집→업로드→DB insert. sort_order = slotIndex 로 위치 영속.
+  const pickAndUploadToSlot = async (slotIndex: number): Promise<boolean> => {
+    if (!userId) {
+      Alert.alert('로그인 필요', '사진/영상을 추가하려면\n먼저 로그인해주세요.')
+      return false
+    }
+    if (!currentId) {
+      Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
+      return false
+    }
+    const picked = await pickMedia()
+    if (!picked) return false
+
+    // 영상: 트림 편집 → 위치 편집 → 업로드
+    if (picked.mediaType === 'video') {
+      const slotSize = slotLayoutsRef.current[slotIndex]
+      const aspect = slotSize && slotSize.height > 0 ? slotSize.width / slotSize.height : 1
+      return new Promise<boolean>((resolve) => {
+        setVideoTrimEditor({
+          uri: picked.uri,
+          duration: picked.durationSeconds ?? 10,
+          width: picked.width ?? 1080,
+          height: picked.height ?? 1920,
+          slotAspect: aspect,
+          slotIndex,
+        })
+        pendingPickRef.current = { picked, resolve }
+      })
+    }
+
+    // 사진: 슬롯 비율 계산 후 편집 모달
+    const slotSize = slotLayoutsRef.current[slotIndex]
+    const aspect = slotSize && slotSize.height > 0 ? slotSize.width / slotSize.height : 1
+    return new Promise<boolean>((resolve) => {
+      setCropEditor({
+        uri: picked.uri,
+        width: picked.width ?? 1000,
+        height: picked.height ?? 1000,
+        slotAspect: aspect,
+        slotIndex,
+      })
+      pendingPickRef.current = { picked, resolve }
+    })
+  }
+
+  const pendingPickRef = useRef<{
+    picked: Awaited<ReturnType<typeof pickMedia>>
+    resolve: (v: boolean) => void
+  } | null>(null)
 
   const showMediaError = (e: unknown) => {
     if (e instanceof VideoTooLongError) {
@@ -867,6 +928,7 @@ export function PlaceDetailSheet({
           key={slotIndex}
           style={[style, styles.slotEmptyEdit]}
           onPress={() => handleAddToSlot(slotIndex)}
+          onLayout={(e) => { slotLayoutsRef.current[slotIndex] = e.nativeEvent.layout }}
           disabled={mediaBusy}
         >
           {mediaBusy ? (
@@ -986,7 +1048,108 @@ export function PlaceDetailSheet({
   // Collapsed: 헤더 + 액션 버튼만. 사진/탭바/영업시간/수정 버튼 숨김 (part2/7 명세)
   const showBody = snapState !== 'collapsed'
 
+  const handleVideoTrimConfirm = (trim: { startTime: number; endTime: number; duration: number }) => {
+    if (!videoTrimEditor) return
+    const { uri, width, height, slotAspect, slotIndex } = videoTrimEditor
+    setVideoTrimEditor(null)
+    setVideoPositionEditor({ uri, trim, width, height, slotAspect, slotIndex })
+  }
+
+  const handleVideoTrimCancel = () => {
+    const pending = pendingPickRef.current
+    setVideoTrimEditor(null)
+    pendingPickRef.current = null
+    pending?.resolve(false)
+  }
+
+  const handleVideoPositionConfirm = async (_ox: number, _oy: number, _scale: number) => {
+    const pending = pendingPickRef.current
+    const editor = videoPositionEditor
+    setVideoPositionEditor(null)
+    pendingPickRef.current = null
+    if (!pending || !editor) return
+    try {
+      setMediaBusy(true)
+      const ok = await uploadPickedPhoto(editor.uri, pending.picked, editor.slotIndex)
+      if (ok && currentId) {
+        await load(currentId)
+        onChanged?.()
+      }
+      pending.resolve(ok)
+    } catch (e) {
+      showMediaError(e)
+      pending.resolve(false)
+    } finally {
+      setMediaBusy(false)
+    }
+  }
+
+  const handleVideoPositionCancel = () => {
+    const pending = pendingPickRef.current
+    setVideoPositionEditor(null)
+    pendingPickRef.current = null
+    pending?.resolve(false)
+  }
+
+  const handleCropConfirm = async (croppedUri: string) => {
+    const pending = pendingPickRef.current
+    setCropEditor(null)
+    pendingPickRef.current = null
+    if (!pending) return
+    try {
+      setMediaBusy(true)
+      const ok = await uploadPickedPhoto(croppedUri, pending.picked, cropEditor?.slotIndex ?? 0)
+      if (ok && currentId) {
+        await load(currentId)
+        onChanged?.()
+      }
+      pending.resolve(ok)
+    } catch (e) {
+      showMediaError(e)
+      pending.resolve(false)
+    } finally {
+      setMediaBusy(false)
+    }
+  }
+
+  const handleCropCancel = () => {
+    const pending = pendingPickRef.current
+    setCropEditor(null)
+    pendingPickRef.current = null
+    pending?.resolve(false)
+  }
+
   return (
+    <>
+    {videoTrimEditor && (
+      <VideoTrimEditor
+        uri={videoTrimEditor.uri}
+        videoDuration={videoTrimEditor.duration}
+        onConfirm={handleVideoTrimConfirm}
+        onCancel={handleVideoTrimCancel}
+      />
+    )}
+    {videoPositionEditor && (
+      <VideoPositionEditor
+        uri={videoPositionEditor.uri}
+        trim={videoPositionEditor.trim}
+        videoWidth={videoPositionEditor.width}
+        videoHeight={videoPositionEditor.height}
+        slotAspect={videoPositionEditor.slotAspect}
+        onConfirm={(ox, oy, s) => void handleVideoPositionConfirm(ox, oy, s)}
+        onCancel={handleVideoPositionCancel}
+      />
+    )}
+    {cropEditor && (
+      <PhotoCropEditor
+        uri={cropEditor.uri}
+        imageWidth={cropEditor.width}
+        imageHeight={cropEditor.height}
+        slotAspect={cropEditor.slotAspect}
+        onConfirm={(uri) => void handleCropConfirm(uri)}
+        onCancel={handleCropCancel}
+      />
+    )}
     <Modal visible={visible} transparent animationType="none" onRequestClose={onClose}>
       {/* 지도가 계속 보여야 하므로 어두운 overlay 없이 투명 영역만 둠 */}
       <Pressable style={styles.backdrop} onPress={() => closeSheet()} />
@@ -1391,6 +1554,7 @@ export function PlaceDetailSheet({
         </View>
       </Modal>
     </Modal>
+    </>
   )
 }
 
