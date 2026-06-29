@@ -16,6 +16,7 @@ const corsHeaders = {
 interface SearchRequest {
   query: string
   locationBias?: { latitude: number; longitude: number } | null
+  languageCode?: string | null
 }
 
 interface PlaceResult {
@@ -60,7 +61,7 @@ serve(async (req: Request) => {
   }
 
   try {
-    const { query, locationBias } = (await req.json()) as SearchRequest
+    const { query, locationBias, languageCode } = (await req.json()) as SearchRequest
 
     if (!query?.trim()) {
       return new Response(JSON.stringify([]), {
@@ -79,7 +80,7 @@ serve(async (req: Request) => {
 
     const body: Record<string, unknown> = {
       textQuery: query,
-      languageCode: 'ko',
+      languageCode: languageCode ?? 'ko',
     }
 
     if (locationBias) {

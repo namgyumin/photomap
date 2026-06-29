@@ -28,7 +28,7 @@ serve(async (req: Request) => {
   }
 
   try {
-    const { placeId } = (await req.json()) as { placeId: string }
+    const { placeId, languageCode } = (await req.json()) as { placeId: string; languageCode?: string }
 
     if (!placeId?.trim()) {
       return new Response(JSON.stringify({ error: 'placeId required' }), {
@@ -51,7 +51,7 @@ serve(async (req: Request) => {
         'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
           'id,displayName,formattedAddress,location,regularOpeningHours,internationalPhoneNumber,websiteUri,photos,rating,userRatingCount,primaryTypeDisplayName',
-        'Accept-Language': 'ko',
+        'Accept-Language': languageCode ?? 'ko',
       },
     })
 

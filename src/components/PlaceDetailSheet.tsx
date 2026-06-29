@@ -49,6 +49,7 @@ import {
 } from '../services/memories'
 import type { Media, MemoryDetail, SavedList, Visibility } from '../types/database'
 import { useTranslation } from 'react-i18next'
+import i18n from '../i18n'
 import { PhotoCropEditor } from './PhotoCropEditor'
 import { VideoTrimEditor } from './VideoTrimEditor'
 import { VideoPositionEditor, type PositionResult } from './VideoPositionEditor'
@@ -797,7 +798,7 @@ export function PlaceDetailSheet({
       return
     }
     let cancelled = false
-    withRetry(() => fetchPlaceDetails(googlePlaceId))
+    withRetry(() => fetchPlaceDetails(googlePlaceId, i18n.language))
       .then((d) => {
         if (!cancelled) setPlaceDetails(d)
       })

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import i18n from '../../src/i18n'
 import Svg, { Circle, Path } from 'react-native-svg'
 import {
   ActivityIndicator,
@@ -251,7 +252,7 @@ export default function MapScreen() {
         if (!sessionTokenRef.current) {
           sessionTokenRef.current = createPlacesSessionToken()
         }
-        const res = await withRetry(() => searchPlaces(q, userLocation ?? undefined, sessionTokenRef.current ?? undefined))
+        const res = await withRetry(() => searchPlaces(q, userLocation ?? undefined, sessionTokenRef.current ?? undefined, i18n.language))
         setResults(res)
         if (res[0]) {
           mapRef.current?.animateToRegion({

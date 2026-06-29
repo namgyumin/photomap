@@ -40,7 +40,8 @@ export function buildPhotoUrl(photoName: string, maxWidthPx = 800): string {
 export async function searchPlaces(
   query: string,
   locationBias?: { latitude: number; longitude: number },
-  sessionToken?: string
+  sessionToken?: string,
+  languageCode?: string
 ): Promise<PlaceSearchResult[]> {
   if (!query.trim()) return []
 
@@ -60,6 +61,7 @@ export async function searchPlaces(
           query,
           locationBias: locationBias ?? null,
           sessionToken: sessionToken ?? null,
+          languageCode: languageCode ?? 'ko',
         }),
       })
       if (res.ok) {
@@ -95,7 +97,7 @@ export async function searchPlaces(
 
   // NOTE: places:searchText 는 sessionToken 필드를 지원하지 않음 (Autocomplete 전용).
   // body에 넣으면 400 INVALID_ARGUMENT 발생.
-  const body: Record<string, unknown> = { textQuery: query, languageCode: 'ko' }
+  const body: Record<string, unknown> = { textQuery: query, languageCode: languageCode ?? 'ko' }
   if (locationBias) {
     body.locationBias = {
       circle: {
@@ -136,7 +138,7 @@ export async function searchPlaces(
     }))
 }
 
-export async function fetchPlaceDetails(placeId: string): Promise<PlaceDetailsResult | null> {
+export async function fetchPlaceDetails(placeId: string, languageCode?: string): Promise<PlaceDetailsResult | null> {
   if (!placeId.trim() || !edgeFunctionUrl || !supabaseAnonKey) return null
 
   const { data: sessionData } = await supabase.auth.getSession()
@@ -148,7 +150,7 @@ export async function fetchPlaceDetails(placeId: string): Promise<PlaceDetailsRe
       apikey: supabaseAnonKey,
       Authorization: `Bearer ${accessToken ?? supabaseAnonKey}`,
     },
-    body: JSON.stringify({ placeId }),
+    body: JSON.stringify({ placeId, languageCode: languageCode ?? 'ko' }),
   })
 
   if (res.status === 404) return null
