@@ -1,13 +1,15 @@
 import { Image } from 'react-native'
 import { Tabs } from 'expo-router'
+import { useTranslation } from 'react-i18next'
 
 export default function TabLayout() {
+  const { t } = useTranslation()
   return (
     <Tabs>
       <Tabs.Screen
         name="index"
         options={{
-          title: '지도',
+          title: t('tabs.map'),
           headerShown: false,
           tabBarIcon: ({ color, size }) => (
             <Image
@@ -20,7 +22,7 @@ export default function TabLayout() {
       <Tabs.Screen
         name="memories"
         options={{
-          title: '기록',
+          title: t('tabs.memories'),
           tabBarIcon: ({ color, size }) => (
             <Image
               source={require('../../assets/icons/tab-memories.png')}
@@ -32,7 +34,7 @@ export default function TabLayout() {
       <Tabs.Screen
         name="profile"
         options={{
-          title: '프로필',
+          title: t('tabs.profile'),
           tabBarIcon: ({ color, size }) => (
             <Image
               source={require('../../assets/icons/tab-profile.png')}

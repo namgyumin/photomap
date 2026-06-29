@@ -65,6 +65,16 @@ export interface Media {
   is_cover: boolean
   media_type: MediaType
   duration_seconds: number | null
+  video_start_time: number | null
+  video_end_time: number | null
+  video_offset_x: number | null
+  video_offset_y: number | null
+  video_scale: number | null
+  // 로컬 미디어: 뷰포트 대비 정규화 비율(영상 위치/크기 재현용)
+  video_box_w_frac?: number | null
+  video_box_h_frac?: number | null
+  video_offset_x_frac?: number | null
+  video_offset_y_frac?: number | null
   sort_order: number
   latitude: number | null
   longitude: number | null

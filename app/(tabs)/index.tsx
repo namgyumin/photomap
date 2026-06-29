@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import Svg, { Circle, Path } from 'react-native-svg'
 import {
   ActivityIndicator,
@@ -21,6 +22,17 @@ import { edgeFunctionUrl, hasGoogleMapsKey } from '../../src/lib/config'
 import { searchPlaces, type PlaceSearchResult } from '../../src/lib/googlePlaces'
 import { loadMapMarkers, type MapMarker } from '../../src/services/memories'
 import { useAuth } from '../../src/hooks/useAuth'
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 5, delayMs = 800): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i < maxAttempts; i++) {
+    try { return await fn() } catch (e) {
+      lastErr = e
+      if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1)))
+    }
+  }
+  throw lastErr
+}
 
 const SEOUL: Region = {
   latitude: 37.5665,
@@ -104,18 +116,11 @@ function MapPin({ color = '#111111', size = 36 }: { color?: string; size?: numbe
 }
 
 function SavedMarkerContent({ marker }: { marker: SavedMarker }) {
-  const thumb = marker.place.heroPhotoUrl
-  if (thumb) {
-    return (
-      <View style={[styles.photoMarker, marker.listColor ? { borderColor: marker.listColor } : null]}>
-        <Image source={{ uri: thumb }} style={styles.photoMarkerImage} />
-      </View>
-    )
-  }
   return <MapPin color={marker.listColor ?? '#111111'} size={36} />
 }
 
 export default function MapScreen() {
+  const { t } = useTranslation()
   const { userId } = useAuth()
   const router = useRouter()
   const params = useLocalSearchParams<{
@@ -206,7 +211,7 @@ export default function MapScreen() {
     if (placeId && Number.isFinite(lat) && Number.isFinite(lng)) {
       const place: PlaceSearchResult = {
         googlePlaceId: placeId,
-        name: one(params.placeName) || '장소',
+        name: one(params.placeName) || t('map.place'),
         address: one(params.placeAddress) || null,
         latitude: lat,
         longitude: lng,
@@ -236,8 +241,8 @@ export default function MapScreen() {
       // Edge Function 경로는 클라이언트 키가 필요 없음 — 둘 다 없을 때만 차단
       if (!hasGoogleMapsKey && !edgeFunctionUrl) {
         Alert.alert(
-          '검색 비활성화',
-          'Google Maps API 키가 설정되지 않았어요.\nGOOGLE_MAPS_API_KEY 를 설정해주세요.'
+          t('place.searchDisabled'),
+          t('map.apiKeyMissing')
         )
         return
       }
@@ -246,7 +251,7 @@ export default function MapScreen() {
         if (!sessionTokenRef.current) {
           sessionTokenRef.current = createPlacesSessionToken()
         }
-        const res = await searchPlaces(q, userLocation ?? undefined, sessionTokenRef.current)
+        const res = await withRetry(() => searchPlaces(q, userLocation ?? undefined, sessionTokenRef.current ?? undefined))
         setResults(res)
         if (res[0]) {
           mapRef.current?.animateToRegion({
@@ -257,7 +262,7 @@ export default function MapScreen() {
           })
         }
       } catch (e) {
-        Alert.alert('검색 실패', String((e as Error).message))
+        Alert.alert(t('place.searchFail'), String((e as Error).message))
       } finally {
         setSearching(false)
       }
@@ -328,6 +333,17 @@ export default function MapScreen() {
         showsUserLocation
         showsMyLocationButton={false}
         onRegionChangeComplete={setCurrentRegion}
+        onPoiClick={(e) => {
+          const { placeId, name, coordinate } = e.nativeEvent
+          openSearchPlace({
+            googlePlaceId: placeId,
+            name,
+            address: null,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude,
+            heroPhotoUrl: null,
+          })
+        }}
       >
         {savedMarkers.length > CLUSTER_THRESHOLD
           ? clusters.map((cluster) => {
@@ -367,7 +383,7 @@ export default function MapScreen() {
             })
           : savedMarkers.map((m) => (
               <Marker
-                key={m.memoryId}
+                key={`${m.memoryId}-${m.listColor ?? 'default'}`}
                 coordinate={{ latitude: m.place.latitude, longitude: m.place.longitude }}
                 title={m.place.name}
                 tracksViewChanges={false}
@@ -391,7 +407,7 @@ export default function MapScreen() {
       {/* 마커 로드 실패 배너 */}
       {markersError && (
         <View style={styles.errorBanner}>
-          <Text style={styles.errorBannerText}>기록을 불러오지 못했어요. 잠시 후 다시 시도해주세요.</Text>
+          <Text style={styles.errorBannerText}>{t('map.loadFail')}</Text>
         </View>
       )}
 
@@ -400,7 +416,7 @@ export default function MapScreen() {
         <View style={styles.searchBar}>
           <TextInput
             style={styles.searchInput}
-            placeholder="장소 검색"
+            placeholder={t('place.searchPlaceholder')}
             value={query}
             onChangeText={handleSearchInput}
             onSubmitEditing={handleSearchSubmit}
@@ -410,7 +426,7 @@ export default function MapScreen() {
             {searching ? (
               <ActivityIndicator color="#fff" />
             ) : (
-              <Text style={styles.searchBtnText}>검색</Text>
+              <Text style={styles.searchBtnText}>{t('map.search')}</Text>
             )}
           </Pressable>
         </View>

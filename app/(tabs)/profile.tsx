@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import { useCallback, useState } from 'react'
 import {
   ActivityIndicator,
@@ -17,12 +18,15 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import { useAuth } from '../../src/hooks/useAuth'
 import { pickAndUploadAvatar } from '../../src/lib/media'
 import { supabase } from '../../src/lib/supabase'
+import { setLanguage } from '../../src/i18n'
 import { deleteGuestAccountAndSignOut } from '../../src/services/auth'
 import { getMyProfile, updateMyProfile, type UserProfile } from '../../src/services/profile'
 
 WebBrowser.maybeCompleteAuthSession()
 
 export default function ProfileScreen() {
+  const { t, i18n } = useTranslation()
+  const currentLang = i18n.language === 'ko' ? 'ko' : 'en'
   const { session, userId } = useAuth()
   const user = session?.user
   const isGuest = Boolean(user?.is_anonymous)
@@ -68,8 +72,8 @@ export default function ProfileScreen() {
     } catch (e) {
       const msg = (e as Error).message
       Alert.alert(
-        '사진 업로드 실패',
-        msg === 'PERMISSION_DENIED' ? '사진 접근 권한을 허용해주세요.' : msg
+        t('media.uploadFail'),
+        msg === 'PERMISSION_DENIED' ? t('media.photoPermission') : msg
       )
     } finally {
       setUploadingAvatar(false)
@@ -79,7 +83,7 @@ export default function ProfileScreen() {
   const handleSaveProfile = async () => {
     const name = editName.trim()
     if (!name) {
-      Alert.alert('이름 필요', '이름(닉네임)을 입력해주세요.')
+      Alert.alert(t('auth.nicknameRequired'), t('auth.nicknamePlaceholder'))
       return
     }
     setSavingProfile(true)
@@ -88,7 +92,7 @@ export default function ProfileScreen() {
       await loadProfile()
       setEditVisible(false)
     } catch (e) {
-      Alert.alert('저장 실패', String((e as Error).message))
+      Alert.alert(t('place.saveFail'), String((e as Error).message))
     } finally {
       setSavingProfile(false)
     }
@@ -103,7 +107,7 @@ export default function ProfileScreen() {
         provider: 'google',
         options: { redirectTo, skipBrowserRedirect: true },
       })
-      if (error || !data?.url) throw error ?? new Error('인증 URL을 가져오지 못했어요.')
+      if (error || !data?.url) throw error ?? new Error(t('auth.authUrlFail'))
 
       const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo)
       if (result.type === 'success' && result.url) {
@@ -123,10 +127,10 @@ export default function ProfileScreen() {
           if (sessionErr) throw sessionErr
         }
         await supabase.auth.refreshSession()
-        Alert.alert('연동 완료', 'Google 계정과 연결됐어요.\n이제 데이터가 계정에 안전하게 보관돼요.')
+        Alert.alert(t('auth.linkDone'), t('profile.googleLinked'))
       }
     } catch (e) {
-      Alert.alert('연동 실패', String((e as Error).message))
+      Alert.alert(t('auth.linkFail'), String((e as Error).message))
     } finally {
       setLinking(false)
     }
@@ -134,13 +138,13 @@ export default function ProfileScreen() {
 
   const handleLogout = () => {
     const message = isGuest
-      ? '게스트 계정은 로그아웃하는 순간 데이터가 바로 삭제돼요.\n로그인하지 않은 상태로 30일이 지나도 자동 삭제될 수 있어요.\n정말 로그아웃할까요?'
-      : '로그아웃하시겠어요?'
+      ? t('profile.guestLogoutWarn')
+      : t('auth.logoutConfirm')
 
-    Alert.alert('로그아웃', message, [
-      { text: '취소', style: 'cancel' },
+    Alert.alert(t('auth.logout'), message, [
+      { text: t('common.cancel'), style: 'cancel' },
       {
-        text: '로그아웃',
+        text: t('auth.logout'),
         style: 'destructive',
         onPress: async () => {
           try {
@@ -150,7 +154,7 @@ export default function ProfileScreen() {
               await supabase.auth.signOut()
             }
           } catch (err) {
-            Alert.alert('오류', (err as Error).message)
+            Alert.alert(t('common.error'), (err as Error).message)
           }
         },
       },
@@ -160,7 +164,7 @@ export default function ProfileScreen() {
   if (!user) {
     return (
       <SafeAreaView style={styles.center} edges={['top']}>
-        <Text style={styles.emptyText}>로그인이 필요해요</Text>
+        <Text style={styles.emptyText}>{t('profile.loginRequired')}</Text>
       </SafeAreaView>
     )
   }
@@ -170,11 +174,11 @@ export default function ProfileScreen() {
     (user.user_metadata?.full_name as string | undefined) ??
     user.email ??
     userId ??
-    '사용자'
+    t('place.user')
   const avatarUrl = profile?.avatar_url ?? null
   const email = user.email ?? ''
   const initial = displayName.charAt(0).toUpperCase()
-  const accountLabel = isGuest ? '게스트 계정 · 로그아웃 시 데이터 즉시 삭제' : '일반 계정'
+  const accountLabel = isGuest ? t('auth.guestNote') : t('auth.normalAccount')
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -193,28 +197,50 @@ export default function ProfileScreen() {
 
       <View style={styles.actions}>
         <Pressable style={styles.actionBtn} onPress={openEdit}>
-          <Text style={styles.actionText}>프로필 수정</Text>
+          <Text style={styles.actionText}>{t('profile.editProfile')}</Text>
         </Pressable>
         {isGuest && (
           <Pressable style={styles.actionBtn} onPress={handleLinkGoogle} disabled={linking}>
             {linking ? (
               <ActivityIndicator size="small" />
             ) : (
-              <Text style={styles.actionText}>Google 계정과 연동</Text>
+              <Text style={styles.actionText}>{t('profile.linkGoogle')}</Text>
             )}
           </Pressable>
         )}
       </View>
 
+      <View style={styles.languageRow}>
+        <Text style={styles.languageLabel}>{t('profile.language')}</Text>
+        <View style={styles.languageBtns}>
+          <Pressable
+            style={[styles.langBtn, currentLang === 'ko' && styles.langBtnActive]}
+            onPress={() => setLanguage('ko')}
+          >
+            <Text style={[styles.langBtnText, currentLang === 'ko' && styles.langBtnTextActive]}>
+              {t('profile.languageKo')}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.langBtn, currentLang === 'en' && styles.langBtnActive]}
+            onPress={() => setLanguage('en')}
+          >
+            <Text style={[styles.langBtnText, currentLang === 'en' && styles.langBtnTextActive]}>
+              {t('profile.languageEn')}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+
       <Pressable style={styles.logoutBtn} onPress={handleLogout}>
-        <Text style={styles.logoutText}>로그아웃</Text>
+        <Text style={styles.logoutText}>{t('auth.logout')}</Text>
       </Pressable>
 
       {/* 프로필 수정 모달 */}
       <Modal visible={editVisible} transparent animationType="fade" onRequestClose={() => setEditVisible(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditVisible(false)}>
           <Pressable style={styles.modalCard} onPress={() => {}}>
-            <Text style={styles.modalTitle}>프로필 수정</Text>
+            <Text style={styles.modalTitle}>{t('profile.editProfile')}</Text>
 
             <Pressable style={styles.modalAvatarWrap} onPress={handlePickAvatar} disabled={uploadingAvatar}>
               {editAvatarUrl ? (
@@ -228,14 +254,14 @@ export default function ProfileScreen() {
                 <ActivityIndicator style={styles.modalAvatarBadge} size="small" />
               ) : (
                 <View style={styles.modalAvatarBadge}>
-                  <Text style={styles.modalAvatarBadgeText}>사진 변경</Text>
+                  <Text style={styles.modalAvatarBadgeText}>{t('profile.changePhoto')}</Text>
                 </View>
               )}
             </Pressable>
 
             <TextInput
               style={styles.modalInput}
-              placeholder="이름(닉네임)"
+              placeholder={t('auth.nickname')}
               value={editName}
               onChangeText={setEditName}
               maxLength={30}
@@ -244,7 +270,7 @@ export default function ProfileScreen() {
 
             <View style={styles.modalButtons}>
               <Pressable style={[styles.modalBtn, styles.modalBtnCancel]} onPress={() => setEditVisible(false)}>
-                <Text style={styles.modalBtnCancelText}>취소</Text>
+                <Text style={styles.modalBtnCancelText}>{t('common.cancel')}</Text>
               </Pressable>
               <Pressable
                 style={[styles.modalBtn, styles.modalBtnSave]}
@@ -254,7 +280,7 @@ export default function ProfileScreen() {
                 {savingProfile ? (
                   <ActivityIndicator size="small" color="#fff" />
                 ) : (
-                  <Text style={styles.modalBtnSaveText}>저장</Text>
+                  <Text style={styles.modalBtnSaveText}>{t('common.save')}</Text>
                 )}
               </Pressable>
             </View>
@@ -297,6 +323,27 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   actionText: { fontSize: 15, fontWeight: '600', color: '#222' },
+  languageRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 24,
+    marginBottom: 12,
+    paddingHorizontal: 4,
+  },
+  languageLabel: { fontSize: 15, fontWeight: '600', color: '#222' },
+  languageBtns: { flexDirection: 'row', gap: 8 },
+  langBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    backgroundColor: '#f5f5f5',
+  },
+  langBtnActive: { backgroundColor: '#1a73e8', borderColor: '#1a73e8' },
+  langBtnText: { fontSize: 14, fontWeight: '600', color: '#555' },
+  langBtnTextActive: { color: '#fff' },
   logoutBtn: {
     marginTop: 'auto',
     backgroundColor: '#fff',

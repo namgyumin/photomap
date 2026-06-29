@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import * as ImageManipulator from 'expo-image-manipulator'
 import { useRef, useState } from 'react'
 import {
@@ -32,6 +33,7 @@ interface Props {
 }
 
 export function PhotoCropEditor({ uri, imageWidth, imageHeight, slotAspect, onConfirm, onCancel }: Props) {
+  const { t } = useTranslation()
   const VIEWPORT_W = SCREEN.width - 48
   const VIEWPORT_H = VIEWPORT_W / slotAspect
   const scaleToFit = Math.max(VIEWPORT_W / imageWidth, VIEWPORT_H / imageHeight)
@@ -118,17 +120,17 @@ export function PhotoCropEditor({ uri, imageWidth, imageHeight, slotAspect, onCo
       <GestureHandlerRootView style={styles.container}>
         <View style={styles.header}>
           <Pressable onPress={onCancel} style={styles.headerBtn}>
-            <Text style={styles.headerBtnText}>취소</Text>
+            <Text style={styles.headerBtnText}>{t('common.cancel')}</Text>
           </Pressable>
-          <Text style={styles.headerTitle}>사진 편집</Text>
+          <Text style={styles.headerTitle}>{t('video.photoEdit')}</Text>
           <Pressable onPress={() => void handleConfirm()} style={[styles.headerBtn, styles.confirmBtn]}>
-            <Text style={[styles.headerBtnText, styles.confirmText]}>완료</Text>
+            <Text style={[styles.headerBtnText, styles.confirmText]}>{t('video.confirmBtn')}</Text>
           </Pressable>
         </View>
 
         <GestureDetector gesture={composed}>
           <View style={styles.body}>
-            <Text style={styles.hint}>드래그·핀치로 위치/크기 조정</Text>
+            <Text style={styles.hint}>{t('video.positionHint')}</Text>
 
             <View style={styles.dimFrame}>
               <Animated.View style={[animStyle, { opacity: 0.3 }]}>

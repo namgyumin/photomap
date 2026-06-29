@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { makeRedirectUri } from 'expo-auth-session'
 import * as Linking from 'expo-linking'
@@ -18,21 +19,21 @@ WebBrowser.maybeCompleteAuthSession()
 
 const ONBOARDING_KEY = 'photomap_onboarding_done'
 
-const SLIDES = [
-  {
-    title: '오늘 간 곳을\n지도에 남겨요',
-    subtitle: '검색으로 장소를 찾고 내 기록으로 저장해요',
-    emoji: '🗺️',
-  },
-  {
-    title: '사진과 함께\n내 기록을 만들어요',
-    subtitle: '찍은 사진을 장소마다 모아두어요',
-    emoji: '📸',
-  },
-]
-
 export default function LoginScreen() {
+  const { t } = useTranslation()
   const router = useRouter()
+  const SLIDES = [
+    {
+      title: t('onboarding.tagline'),
+      subtitle: t('onboarding.desc3'),
+      emoji: '🗺️',
+    },
+    {
+      title: t('onboarding.desc1'),
+      subtitle: t('onboarding.desc2'),
+      emoji: '📸',
+    },
+  ]
   const params = useLocalSearchParams<{ next?: string }>()
   const paramsRef = useRef<string | undefined>(undefined)
   const [slide, setSlide] = useState(0)
@@ -90,7 +91,7 @@ export default function LoginScreen() {
     const sub = Linking.addEventListener('url', ({ url }) => {
       void applySessionFromUrl(url).catch((e: unknown) => {
         const err = e as { message?: string }
-        Alert.alert('로그인 실패', err?.message ?? '오류가 발생했어요.')
+        Alert.alert(t('auth.loginFail'), err?.message ?? t('common.errorOccurred'))
         setLoading(false)
       })
     })
@@ -116,7 +117,7 @@ export default function LoginScreen() {
           skipBrowserRedirect: true,
         },
       })
-      if (error || !data.url) throw error ?? new Error('인증 URL을 가져오지 못했어요.')
+      if (error || !data.url) throw error ?? new Error(t('auth.authUrlFail'))
 
       const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo)
 
@@ -125,7 +126,7 @@ export default function LoginScreen() {
       }
     } catch (e: unknown) {
       const err = e as { message?: string }
-      Alert.alert('로그인 실패', err?.message ?? '오류가 발생했어요.')
+      Alert.alert(t('auth.loginFail'), err?.message ?? t('common.errorOccurred'))
     } finally {
       setLoading(false)
     }
@@ -144,10 +145,10 @@ export default function LoginScreen() {
         err?.message?.includes('Anonymous sign-ins are disabled')
 
       Alert.alert(
-        '게스트 로그인 실패',
+        t('auth.guestLoginFail'),
         isAnonymousDisabled
-          ? '현재 서버에서 게스트 로그인이 비활성화되어 있어요.'
-          : err?.message ?? '오류가 발생했어요.'
+          ? t('auth.guestDisabled')
+          : err?.message ?? t('common.errorOccurred')
       )
     } finally {
       setLoading(false)
@@ -156,11 +157,11 @@ export default function LoginScreen() {
 
   const handleGuestSignIn = () => {
     Alert.alert(
-      '게스트로 시작할까요?',
-      '게스트로 로그인 한 후에 Google로 연동 가능합니다.\n\n게스트 데이터는 로그아웃하는 순간 바로 삭제됩니다.\n\n연동하지 않으면 다시 로그인할 수 없어요.',
+      t('auth.guestStart'),
+      t('auth.guestNote'),
       [
-        { text: '취소', style: 'cancel' },
-        { text: '계속', onPress: () => void performGuestSignIn() },
+        { text: t('common.cancel'), style: 'cancel' },
+        { text: t('auth.continue'), onPress: () => void performGuestSignIn() },
       ]
     )
   }
@@ -187,15 +188,15 @@ export default function LoginScreen() {
         <View style={styles.onboardingActions}>
           {slide < SLIDES.length - 1 ? (
             <Pressable style={styles.primaryBtn} onPress={() => setSlide((s) => s + 1)}>
-              <Text style={styles.primaryBtnText}>다음</Text>
+              <Text style={styles.primaryBtnText}>{t('common.next')}</Text>
             </Pressable>
           ) : (
             <Pressable style={styles.primaryBtn} onPress={finishOnboarding}>
-              <Text style={styles.primaryBtnText}>시작하기</Text>
+              <Text style={styles.primaryBtnText}>{t('common.start')}</Text>
             </Pressable>
           )}
           <Pressable onPress={finishOnboarding}>
-            <Text style={styles.skipText}>건너뛰기</Text>
+            <Text style={styles.skipText}>{t('common.skip')}</Text>
           </Pressable>
         </View>
       </SafeAreaView>
@@ -207,21 +208,21 @@ export default function LoginScreen() {
       <View style={styles.logoArea}>
         <Text style={styles.logoEmoji}>📍</Text>
         <Text style={styles.logoTitle}>photoMap</Text>
-        <Text style={styles.logoSubtitle}>오늘 간 곳을 지도에 남기세요</Text>
+        <Text style={styles.logoSubtitle}>{t('onboarding.tagline')}</Text>
       </View>
 
       <View style={styles.authActions}>
         <Pressable style={[styles.googleBtn, loading && styles.disabledBtn]} onPress={handleGoogleSignIn} disabled={loading}>
           <Text style={styles.googleBtnText}>
-            {loading ? '로그인 중…' : 'Google로 계속하기'}
+            {loading ? t('auth.login') : t('auth.continueWithGoogle')}
           </Text>
         </Pressable>
 
         <Pressable style={[styles.guestBtn, loading && styles.disabledBtn]} onPress={handleGuestSignIn} disabled={loading}>
-          <Text style={styles.guestBtnText}>게스트로 둘러보기</Text>
+          <Text style={styles.guestBtnText}>{t('auth.guestStart')}</Text>
         </Pressable>
         <Text style={styles.guestNotice}>
-          게스트 데이터는 로그아웃 즉시 삭제되며, 마지막 로그인 후 30일이 지나도 자동 삭제될 수 있어요.
+          {t('auth.guestNote')}
         </Text>
       </View>
     </SafeAreaView>

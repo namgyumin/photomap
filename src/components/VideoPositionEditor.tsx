@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import { useVideoPlayer, VideoView } from 'expo-video'
 import { useEffect, useRef, useState } from 'react'
 import {
@@ -27,19 +28,27 @@ interface TrimResult {
   duration: number
 }
 
+export interface PositionResult {
+  boxWFrac: number // 영상 박스 너비 / 뷰포트 너비
+  boxHFrac: number // 영상 박스 높이 / 뷰포트 높이
+  offsetXFrac: number // 가로 오프셋 / 뷰포트 너비
+  offsetYFrac: number // 세로 오프셋 / 뷰포트 높이
+}
+
 interface Props {
   uri: string
   trim: TrimResult
   videoWidth: number
   videoHeight: number
   slotAspect: number
-  onConfirm: (offsetX: number, offsetY: number, scale: number) => void
+  onConfirm: (result: PositionResult) => void
   onCancel: () => void
 }
 
 export function VideoPositionEditor({
   uri, trim, videoWidth, videoHeight, slotAspect, onConfirm, onCancel,
 }: Props) {
+  const { t } = useTranslation()
   const VIEWPORT_W = SCREEN.width - 48
   const VIEWPORT_H = VIEWPORT_W / slotAspect
   const scaleToFit = Math.max(VIEWPORT_W / videoWidth, VIEWPORT_H / videoHeight)
@@ -124,20 +133,27 @@ export function VideoPositionEditor({
       <GestureHandlerRootView style={styles.container}>
         <View style={styles.header}>
           <Pressable onPress={onCancel} style={styles.headerBtn}>
-            <Text style={styles.headerBtnText}>취소</Text>
+            <Text style={styles.headerBtnText}>{t('common.cancel')}</Text>
           </Pressable>
-          <Text style={styles.headerTitle}>위치 조정</Text>
+          <Text style={styles.headerTitle}>{t('video.positionTitle')}</Text>
           <Pressable
-            onPress={() => onConfirm(snapOffset.x, snapOffset.y, snapScale)}
+            onPress={() =>
+              onConfirm({
+                boxWFrac: (videoWidth * snapScale) / VIEWPORT_W,
+                boxHFrac: (videoHeight * snapScale) / VIEWPORT_H,
+                offsetXFrac: snapOffset.x / VIEWPORT_W,
+                offsetYFrac: snapOffset.y / VIEWPORT_H,
+              })
+            }
             style={[styles.headerBtn, styles.confirmBtn]}
           >
-            <Text style={[styles.headerBtnText, styles.confirmText]}>완료</Text>
+            <Text style={[styles.headerBtnText, styles.confirmText]}>{t('video.confirmBtn')}</Text>
           </Pressable>
         </View>
 
         <GestureDetector gesture={composed}>
           <View style={styles.body}>
-            <Text style={styles.hint}>드래그·핀치로 위치/크기 조정</Text>
+            <Text style={styles.hint}>{t('video.positionHint')}</Text>
 
             <View style={styles.dimFrame}>
               <Animated.View style={[animStyle, { opacity: 0.3 }]}>

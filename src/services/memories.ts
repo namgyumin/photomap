@@ -179,6 +179,11 @@ export interface AddMediaInput {
   localAssetId?: string | null // 기기 사진 라이브러리 asset 참조
   mediaType?: MediaType // 기본 photo
   durationSeconds?: number | null // video 만, 최대 10
+  videoStartTime?: number | null
+  videoEndTime?: number | null
+  videoOffsetX?: number | null
+  videoOffsetY?: number | null
+  videoScale?: number | null
   thumbnail128?: string | null
   thumbnail512?: string | null
   width?: number | null
@@ -201,7 +206,7 @@ export async function addMediaToVisit(input: AddMediaInput): Promise<Media> {
     if (input.durationSeconds == null) {
       throw new Error('video requires durationSeconds')
     }
-    if (input.durationSeconds <= 0 || input.durationSeconds > MAX_VIDEO_SECONDS) {
+    if (input.durationSeconds <= 0 || input.durationSeconds > MAX_VIDEO_SECONDS + 0.1) {
       throw new Error(`video must be 0–${MAX_VIDEO_SECONDS}s`)
     }
   }
@@ -229,6 +234,11 @@ export async function addMediaToVisit(input: AddMediaInput): Promise<Media> {
       local_asset_id: input.localAssetId ?? null,
       media_type: mediaType,
       duration_seconds: mediaType === 'video' ? input.durationSeconds : null,
+      video_start_time: mediaType === 'video' ? (input.videoStartTime ?? null) : null,
+      video_end_time: mediaType === 'video' ? (input.videoEndTime ?? null) : null,
+      video_offset_x: mediaType === 'video' ? (input.videoOffsetX ?? null) : null,
+      video_offset_y: mediaType === 'video' ? (input.videoOffsetY ?? null) : null,
+      video_scale: mediaType === 'video' ? (input.videoScale ?? null) : null,
       thumbnail_128: input.thumbnail128 ?? null,
       thumbnail_512: input.thumbnail512 ?? null,
       width: input.width ?? null,

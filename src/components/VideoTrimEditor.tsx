@@ -1,8 +1,8 @@
+import { useTranslation } from 'react-i18next'
 import * as VideoThumbnails from 'expo-video-thumbnails'
 import { useVideoPlayer, VideoView } from 'expo-video'
 import { useEffect, useRef, useState } from 'react'
 import {
-  Animated,
   Dimensions,
   Modal,
   PanResponder,
@@ -16,8 +16,8 @@ import { Image } from 'react-native'
 const SCREEN = Dimensions.get('window')
 const TIMELINE_W = SCREEN.width - 48
 const THUMB_COUNT = 8
-const MIN_DURATION = 0.98
-const MAX_DURATION = 10
+const MIN_DURATION = 0.499 // 표시상 0.5초
+const MAX_DURATION = 10.01
 
 interface TrimResult {
   startTime: number
@@ -33,15 +33,14 @@ interface Props {
 }
 
 export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Props) {
+  const { t } = useTranslation()
   const clampedTotal = Math.min(videoDuration, 600)
 
   const initEnd = Math.min(clampedTotal, MAX_DURATION)
   const [startRatio, setStartRatio] = useState(0)
   const [endRatio, setEndRatio] = useState(initEnd / clampedTotal)
   const [thumbnails, setThumbnails] = useState<string[]>([])
-  const [toastVisible, setToastVisible] = useState(false)
-  const toastOpacity = useRef(new Animated.Value(0)).current
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [playPos, setPlayPos] = useState(0) // 0~1 ratio within full video
 
   const startTime = startRatio * clampedTotal
   const endTime = endRatio * clampedTotal
@@ -52,15 +51,19 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
     p.play()
   })
 
-  // loop within trim range
+  // loop within trim range + update playhead
   useEffect(() => {
     const interval = setInterval(() => {
-      if (player.currentTime < startTime || player.currentTime >= endTime - 0.1) {
+      const t = player.currentTime
+      if (t < startTime || t >= endTime - 0.1) {
         player.currentTime = startTime
+        setPlayPos(startRatio)
+      } else {
+        setPlayPos(t / clampedTotal)
       }
-    }, 100)
+    }, 50)
     return () => clearInterval(interval)
-  }, [player, startTime, endTime])
+  }, [player, startTime, endTime, startRatio, clampedTotal])
 
   // generate thumbnails
   useEffect(() => {
@@ -82,29 +85,28 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
     return () => { cancelled = true }
   }, [uri, clampedTotal])
 
-  const showToast = () => {
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    Animated.sequence([
-      Animated.timing(toastOpacity, { toValue: 1, duration: 150, useNativeDriver: true }),
-      Animated.delay(1800),
-      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
-    ]).start()
-    toastTimer.current = setTimeout(() => setToastVisible(false), 2400)
-    setToastVisible(true)
-  }
-
   const startRef = useRef(startRatio)
   const endRef = useRef(endRatio)
   startRef.current = startRatio
   endRef.current = endRatio
 
+  // grant 시점의 값을 저장해서 delta 계산
+  const startGrantRef = useRef(0)
+  const endGrantRef = useRef(0)
+  const midGrantStart = useRef(0)
+  const midGrantEnd = useRef(0)
+
   const startPan = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        startGrantRef.current = startRef.current
+      },
       onPanResponderMove: (_, g) => {
         const delta = g.dx / TIMELINE_W
-        let next = Math.max(0, startRef.current + delta)
+        let next = startGrantRef.current + delta
+        next = Math.max(0, next)
         const dur = (endRef.current - next) * clampedTotal
         if (dur < MIN_DURATION) next = endRef.current - MIN_DURATION / clampedTotal
         if (dur > MAX_DURATION) next = endRef.current - MAX_DURATION / clampedTotal
@@ -117,16 +119,39 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        endGrantRef.current = endRef.current
+      },
       onPanResponderMove: (_, g) => {
         const delta = g.dx / TIMELINE_W
-        let next = Math.min(1, endRef.current + delta)
+        let next = endGrantRef.current + delta
+        next = Math.min(1, next)
         const dur = (next - startRef.current) * clampedTotal
         if (dur < MIN_DURATION) next = startRef.current + MIN_DURATION / clampedTotal
-        if (dur > MAX_DURATION) {
-          next = startRef.current + MAX_DURATION / clampedTotal
-          showToast()
-        }
+        if (dur > MAX_DURATION) next = startRef.current + MAX_DURATION / clampedTotal
         setEndRatio(Math.min(1, next))
+      },
+    })
+  ).current
+
+  // 선택 구간 전체 이동
+  const midPan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        midGrantStart.current = startRef.current
+        midGrantEnd.current = endRef.current
+      },
+      onPanResponderMove: (_, g) => {
+        const delta = g.dx / TIMELINE_W
+        const dur = midGrantEnd.current - midGrantStart.current
+        let newStart = midGrantStart.current + delta
+        let newEnd = midGrantEnd.current + delta
+        if (newStart < 0) { newStart = 0; newEnd = dur }
+        if (newEnd > 1) { newEnd = 1; newStart = 1 - dur }
+        setStartRatio(newStart)
+        setEndRatio(newEnd)
       },
     })
   ).current
@@ -145,11 +170,11 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
         {/* 헤더 */}
         <View style={styles.header}>
           <Pressable onPress={onCancel} style={styles.headerBtn}>
-            <Text style={styles.headerBtnText}>취소</Text>
+            <Text style={styles.headerBtnText}>{t('common.cancel')}</Text>
           </Pressable>
-          <Text style={styles.headerTitle}>동영상 편집</Text>
+          <Text style={styles.headerTitle}>{t('video.trimTitle')}</Text>
           <Pressable onPress={handleConfirm} style={styles.headerBtn}>
-            <Text style={[styles.headerBtnText, styles.confirmText]}>설정완료</Text>
+            <Text style={[styles.headerBtnText, styles.confirmText]}>{t('video.confirmBtn')}</Text>
           </Pressable>
         </View>
 
@@ -164,7 +189,7 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
         </View>
 
         {/* 구간 정보 */}
-        <Text style={styles.durationText}>{trimDuration.toFixed(1)}초</Text>
+        <Text style={styles.durationText}>{trimDuration.toFixed(1)}{t('video.seconds')}</Text>
 
         {/* 타임라인 */}
         <View style={styles.timelineWrapper}>
@@ -192,9 +217,21 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
               <View style={[styles.selectionBorder, { left: startPx, width: endPx - startPx }]} />
             </View>
 
+            {/* 재생 위치 표시선 */}
+            <View
+              pointerEvents="none"
+              style={[styles.playhead, { left: playPos * TIMELINE_W - 1 }]}
+            />
+
+            {/* 중간 드래그 영역 — 구간 전체 이동 */}
+            <View
+              style={[styles.midZone, { left: startPx + 14, width: Math.max(0, endPx - startPx - 28) }]}
+              {...midPan.panHandlers}
+            />
+
             {/* 시작 핸들 */}
             <View
-              style={[styles.handle, styles.handleLeft, { left: startPx - 14 }]}
+              style={[styles.handle, { left: startPx - 14 }]}
               {...startPan.panHandlers}
             >
               <View style={styles.handleBar} />
@@ -202,7 +239,7 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
 
             {/* 끝 핸들 */}
             <View
-              style={[styles.handle, styles.handleRight, { left: endPx - 14 }]}
+              style={[styles.handle, { left: endPx - 14 }]}
               {...endPan.panHandlers}
             >
               <View style={styles.handleBar} />
@@ -217,12 +254,6 @@ export function VideoTrimEditor({ uri, videoDuration, onConfirm, onCancel }: Pro
           </View>
         </View>
 
-        {/* 토스트 */}
-        {toastVisible && (
-          <Animated.View style={[styles.toast, { opacity: toastOpacity }]}>
-            <Text style={styles.toastText}>10초 이상은 불가능합니다</Text>
-          </Animated.View>
-        )}
       </View>
     </Modal>
   )
@@ -286,8 +317,25 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     zIndex: 10,
   },
-  handleLeft: {},
-  handleRight: {},
+  playhead: {
+    position: 'absolute',
+    top: -4,
+    bottom: -4,
+    width: 2,
+    backgroundColor: '#fff',
+    borderRadius: 1,
+    zIndex: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 2,
+    elevation: 4,
+  },
+  midZone: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    zIndex: 5,
+  },
   handleBar: {
     width: 4,
     height: 36,
@@ -296,14 +344,4 @@ const styles = StyleSheet.create({
   },
   timeLabels: { flexDirection: 'row', justifyContent: 'space-between' },
   timeLabel: { fontSize: 11, color: '#555' },
-  toast: {
-    position: 'absolute',
-    bottom: 120,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(30,30,30,0.92)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-  },
-  toastText: { color: '#fff', fontSize: 13 },
 })

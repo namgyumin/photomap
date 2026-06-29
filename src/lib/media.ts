@@ -122,7 +122,6 @@ export async function pickMediaMultiple(): Promise<PickedMedia[]> {
     if (isVideo) {
       const secs = asset.duration != null ? Math.round((asset.duration / 1000) * 10) / 10 : null
       if (secs == null || secs <= 0) throw new Error('video duration unknown')
-      if (secs > MAX_VIDEO_SECONDS) throw new VideoTooLongError(secs)
     }
     picked.push(assetToPickedMedia(asset))
   }
@@ -152,9 +151,6 @@ export async function pickMedia(): Promise<PickedMedia | null> {
   if (isVideo) {
     if (durationSeconds == null || durationSeconds <= 0) {
       throw new Error('video duration unknown')
-    }
-    if (durationSeconds > MAX_VIDEO_SECONDS) {
-      throw new VideoTooLongError(durationSeconds)
     }
   }
 

@@ -25,31 +25,67 @@ import { useVideoPlayer, VideoView } from 'expo-video'
 import type { PlaceDetailsResult, PlaceSearchResult } from '../lib/googlePlaces'
 import { fetchPlaceDetails } from '../lib/googlePlaces'
 import {
-  cacheVideoLocally,
-  localVideoUri,
   MAX_VIDEO_SECONDS,
   pickMedia,
-  resolveLocalAssetUri,
   resolveMediaUri,
-  uploadMedia,
   VideoTooLongError,
 } from '../lib/media'
 import {
-  addMediaToVisit,
+  addLocalMedia,
+  deleteLocalMedia,
+  listLocalMedia,
+  persistLocalFile,
+  type LocalMedia,
+} from '../lib/localMedia'
+import {
   createOrGetPlace,
   createSavedList,
   createVisitMemory,
   deleteListIfEmpty,
-  deleteMedia,
   deleteVisitMemory,
   getMemoryDetail,
   listSavedLists,
   updateVisitMemoryFields,
 } from '../services/memories'
 import type { Media, MemoryDetail, SavedList, Visibility } from '../types/database'
+import { useTranslation } from 'react-i18next'
 import { PhotoCropEditor } from './PhotoCropEditor'
 import { VideoTrimEditor } from './VideoTrimEditor'
-import { VideoPositionEditor } from './VideoPositionEditor'
+import { VideoPositionEditor, type PositionResult } from './VideoPositionEditor'
+
+// 로컬 미디어 → 렌더링용 Media 형태로 매핑 (storage_path = file:// 로컬 경로)
+function localToMedia(lm: LocalMedia): Media {
+  return {
+    id: lm.id,
+    visit_id: lm.visitId,
+    uploader_id: '',
+    storage_path: lm.uri,
+    local_asset_id: null,
+    thumbnail_128: null,
+    thumbnail_512: lm.uri,
+    width: lm.width,
+    height: lm.height,
+    captured_at: null,
+    is_cover: false,
+    media_type: lm.mediaType,
+    duration_seconds: null,
+    video_start_time: lm.videoStartTime ?? null,
+    video_end_time: lm.videoEndTime ?? null,
+    video_offset_x: null,
+    video_offset_y: null,
+    video_scale: null,
+    video_box_w_frac: lm.boxWFrac ?? null,
+    video_box_h_frac: lm.boxHFrac ?? null,
+    video_offset_x_frac: lm.offsetXFrac ?? null,
+    video_offset_y_frac: lm.offsetYFrac ?? null,
+    sort_order: lm.sortOrder,
+    latitude: null,
+    longitude: null,
+    source_media_id: null,
+    imported_from_user_id: null,
+    created_at: lm.createdAt,
+  }
+}
 
 interface Props {
   visible: boolean
@@ -60,6 +96,45 @@ interface Props {
   onSaved?: (memoryId: string, place: PlaceSearchResult) => void
   onDeleted?: (memoryId: string) => void
   onChanged?: () => void
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 5, delayMs = 800): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i < maxAttempts; i++) {
+    try { return await fn() } catch (e) {
+      lastErr = e
+      if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1)))
+    }
+  }
+  throw lastErr
+}
+
+function RetryImage({ uri, style }: { uri: string; style: object }) {
+  const [loading, setLoading] = useState(true)
+  const [retries, setRetries] = useState(0)
+  const [key, setKey] = useState(0)
+  return (
+    <View style={[style, { overflow: 'hidden' }]}>
+      <Image
+        key={key}
+        source={{ uri }}
+        style={[StyleSheet.absoluteFill, { opacity: loading ? 0 : 1 }]}
+        onLoad={() => setLoading(false)}
+        onError={() => {
+          if (retries < 4) {
+            setTimeout(() => { setRetries(r => r + 1); setKey(k => k + 1) }, 800 * (retries + 1))
+          } else {
+            setLoading(false)
+          }
+        }}
+      />
+      {loading && (
+        <View style={[StyleSheet.absoluteFill, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#F0F0EE' }]}>
+          <ActivityIndicator size="small" color="#1C7B6C" />
+        </View>
+      )}
+    </View>
+  )
 }
 
 // ============================================================
@@ -171,7 +246,6 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
-const UNSUPPORTED_MSG = '이 기능은 지원하지 않아요'
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true)
@@ -189,34 +263,201 @@ function fullUri(m: Media): string | null {
   return resolveMediaUri(m.storage_path ?? m.thumbnail_512)
 }
 
-// 그리드 slot 인라인 영상 — 렌더 즉시 muted 자동재생 + loop
-function SlotVideo({ uri }: { uri: string }) {
+interface VideoMeta {
+  startTime?: number | null
+  endTime?: number | null
+  boxWFrac?: number | null // 영상 박스 너비 / 컨테이너 너비
+  boxHFrac?: number | null // 영상 박스 높이 / 컨테이너 높이
+  offsetXFrac?: number | null
+  offsetYFrac?: number | null
+}
+
+// 그리드 slot 인라인 영상 — 컨테이너 크기 측정 후 정규화 비율로 위치/크기 재현
+function SlotVideo({ uri, meta }: { uri: string; meta?: VideoMeta }) {
+  const startTime = meta?.startTime ?? 0
+  const endTime = meta?.endTime ?? null
+  const [ready, setReady] = useState(false)
+  const [size, setSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 })
   const player = useVideoPlayer(uri, (p) => {
     p.loop = true
     p.muted = true
+    p.currentTime = startTime
     p.play()
   })
+  useEffect(() => {
+    const t = setTimeout(() => setReady(true), 100)
+    return () => clearTimeout(t)
+  }, [])
+  useEffect(() => {
+    if (endTime == null) return
+    const interval = setInterval(() => {
+      try {
+        if (player.currentTime >= endTime - 0.08) player.currentTime = startTime
+      } catch {}
+    }, 80)
+    return () => clearInterval(interval)
+  }, [player, startTime, endTime])
+
+  const bwf = meta?.boxWFrac ?? null
+  const bhf = meta?.boxHFrac ?? null
+  const hasBox = bwf != null && bhf != null && size.w > 0 && size.h > 0
+
   return (
-    <VideoView player={player} style={styles.videoFill} nativeControls={false} contentFit="cover" />
+    <View
+      style={[styles.videoFill, { overflow: 'hidden' }]}
+      onLayout={(e) => setSize({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}
+    >
+      {ready &&
+        (hasBox ? (
+          <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}>
+            <View
+              style={{
+                width: bwf * size.w,
+                height: bhf * size.h,
+                transform: [
+                  { translateX: (meta?.offsetXFrac ?? 0) * size.w },
+                  { translateY: (meta?.offsetYFrac ?? 0) * size.h },
+                ],
+              }}
+            >
+              <VideoView player={player} style={StyleSheet.absoluteFill} nativeControls={false} contentFit="fill" surfaceType="textureView" />
+            </View>
+          </View>
+        ) : (
+          <VideoView player={player} style={StyleSheet.absoluteFill} nativeControls={false} contentFit="cover" surfaceType="textureView" />
+        ))}
+    </View>
   )
 }
 
-// 전체화면 뷰어 영상 — 현재 페이지일 때만 재생 (스와이프 시 이웃 영상 소리 겹침 방지)
-function ViewerVideo({ uri, active }: { uri: string; active: boolean }) {
+// 전체화면 뷰어 영상 — trim 구간만 루프, 전체 영상 contain
+function ViewerVideo({ uri, active, meta }: { uri: string; active: boolean; meta?: VideoMeta }) {
+  const startTime = meta?.startTime ?? 0
+  const endTime = meta?.endTime ?? null
   const player = useVideoPlayer(uri, (p) => {
     p.loop = true
+    p.currentTime = startTime
   })
   useEffect(() => {
-    if (active) {
-      player.play()
-    } else {
-      player.pause()
-    }
+    if (active) player.play()
+    else player.pause()
   }, [active, player])
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (endTime != null && player.currentTime >= endTime - 0.08) player.currentTime = startTime
+    }, 80)
+    return () => clearInterval(interval)
+  }, [player, startTime, endTime])
+
   return <VideoView player={player} style={styles.viewerVideo} contentFit="contain" />
 }
 
-const TABS = ['개요', '메뉴', '리뷰', '사진', '업데이트', '정보'] as const
+// ============================================================
+// 별점 (0.5 단위 표시 + 편집)
+// ============================================================
+const STAR_FILLED = require('../../assets/icons/star-filled.png')
+const STAR_EMPTY = require('../../assets/icons/star-empty.png')
+
+function HalfStar({
+  filled,
+  size,
+  side,
+  onPress,
+}: {
+  filled: boolean
+  size: number
+  side: 'left' | 'right'
+  onPress?: () => void
+}) {
+  const img = (
+    <View style={{ width: size / 2, height: size, overflow: 'hidden' }}>
+      <Image
+        source={filled ? STAR_FILLED : STAR_EMPTY}
+        style={{ width: size, height: size, marginLeft: side === 'right' ? -size / 2 : 0, resizeMode: 'contain' }}
+      />
+    </View>
+  )
+  if (onPress) {
+    return (
+      <Pressable onPress={onPress} hitSlop={3}>
+        {img}
+      </Pressable>
+    )
+  }
+  return img
+}
+
+function Stars({ value, size, onPick }: { value: number; size: number; onPick?: (v: number) => void }) {
+  return (
+    <View style={{ flexDirection: 'row', gap: onPick ? 4 : 1 }}>
+      {[0, 1, 2, 3, 4].map((i) => (
+        <View key={i} style={{ flexDirection: 'row' }}>
+          <HalfStar filled={value >= i + 0.5} size={size} side="left" onPress={onPick ? () => onPick(i + 0.5) : undefined} />
+          <HalfStar filled={value >= i + 1} size={size} side="right" onPress={onPick ? () => onPick(i + 1) : undefined} />
+        </View>
+      ))}
+    </View>
+  )
+}
+
+function RatingEditor({
+  initial,
+  onConfirm,
+  onCancel,
+}: {
+  initial: number
+  onConfirm: (r: number) => void
+  onCancel: () => void
+}) {
+  const { t } = useTranslation()
+  const [r, setR] = useState(initial || 0)
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onCancel}>
+      <Pressable style={ratingStyles.backdrop} onPress={() => onConfirm(r)}>
+        <Pressable style={ratingStyles.card} onPress={() => {}}>
+          <Text style={ratingStyles.title}>{t('rating.title')}</Text>
+          <Stars value={r} size={44} onPick={setR} />
+          <Text style={ratingStyles.value}>{r > 0 ? r.toFixed(1) : '-'}</Text>
+          <Pressable style={ratingStyles.confirm} onPress={() => onConfirm(r)}>
+            <Text style={ratingStyles.confirmText}>{t('common.ok')}</Text>
+          </Pressable>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  )
+}
+
+const ratingStyles = StyleSheet.create({
+  backdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  card: {
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    paddingVertical: 24,
+    paddingHorizontal: 28,
+    alignItems: 'center',
+    gap: 16,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  title: { fontSize: 17, fontWeight: '700', color: '#1A1A1A' },
+  value: { fontSize: 22, fontWeight: '800', color: '#1C7B6C' },
+  confirm: {
+    backgroundColor: '#1C7B6C',
+    borderRadius: 24,
+    paddingVertical: 12,
+    paddingHorizontal: 40,
+  },
+  confirmText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+})
+
 
 // ============================================================
 // 사진 레이아웃 시스템 (fixplan part5)
@@ -244,17 +485,18 @@ const LAYOUT_SLOT_COUNT: Record<PhotoLayoutType, number> = {
   threeBottomHero: 3,
 }
 
-const LAYOUT_OPTIONS: Array<{ type: PhotoLayoutType; label: string }> = [
-  { type: 'single', label: '1장 전체' },
-  { type: 'twoVertical', label: '2장 좌우' },
-  { type: 'twoHorizontal', label: '2장 위아래' },
-  { type: 'threeLeftHero', label: '왼쪽 대표' },
-  { type: 'threeRightHero', label: '오른쪽 대표' },
-  { type: 'threeTopHero', label: '상단 대표' },
-  { type: 'threeBottomHero', label: '하단 대표' },
+const LAYOUT_OPTIONS_BASE: Array<{ type: PhotoLayoutType; labelKey: string }> = [
+  { type: 'single', labelKey: 'place.layoutSingle' },
+  { type: 'twoVertical', labelKey: 'place.layoutTwoV' },
+  { type: 'twoHorizontal', labelKey: 'place.layoutTwoH' },
+  { type: 'threeLeftHero', labelKey: 'place.layoutLeft' },
+  { type: 'threeRightHero', labelKey: 'place.layoutRight' },
+  { type: 'threeTopHero', labelKey: 'place.layoutTop' },
+  { type: 'threeBottomHero', labelKey: 'place.layoutBottom' },
 ]
 
 const LAYOUT_STORAGE_PREFIX = 'photomap:placeSheetLayout:'
+const RATING_STORAGE_PREFIX = 'photomap:userRating:'
 
 // 저장 목록 색상 팔레트
 const LIST_COLORS = [
@@ -354,6 +596,12 @@ export function PlaceDetailSheet({
   onDeleted,
   onChanged,
 }: Props) {
+  const { t } = useTranslation()
+  const TABS = [t('place.overview'), t('place.menu'), t('place.reviews'), t('place.photos'), t('place.updates'), t('place.info')]
+  const LAYOUT_OPTIONS = LAYOUT_OPTIONS_BASE.map((o) => ({
+    type: o.type,
+    label: o.labelKey.startsWith('place.') ? t(o.labelKey) : o.labelKey,
+  }))
   const { show: showInterstitial } = useInterstitialAd()
 
   // Sheet
@@ -384,6 +632,9 @@ export function PlaceDetailSheet({
   // Data
   const [currentId, setCurrentId] = useState<string | null>(memoryId ?? null)
   const [detail, setDetail] = useState<MemoryDetail | null>(null)
+  const [localMediaList, setLocalMediaList] = useState<LocalMedia[]>([])
+  const [userRating, setUserRating] = useState<number | null>(null)
+  const [ratingEditorVisible, setRatingEditorVisible] = useState(false)
   const [placeDetails, setPlaceDetails] = useState<PlaceDetailsResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -467,14 +718,17 @@ export function PlaceDetailSheet({
   const load = useCallback(async (id: string) => {
     setLoading(true)
     try {
-      const d = await getMemoryDetail(id)
+      const d = await withRetry(() => getMemoryDetail(id))
       setDetail(d)
       setVisitedAt(d.memory.visited_at?.slice(0, 10) || todayIso())
       setIsSaved(d.memory.is_saved)
+      // 미디어는 로컬 스토어에서 로드 (DB 미사용)
+      const lm = await listLocalMedia(id)
+      setLocalMediaList(lm)
       const storedLayout = await AsyncStorage.getItem(LAYOUT_STORAGE_PREFIX + id).catch(() => null)
-      setLayoutType(isPhotoLayoutType(storedLayout) ? storedLayout : defaultLayoutFor(d.media.length))
+      setLayoutType(isPhotoLayoutType(storedLayout) ? storedLayout : defaultLayoutFor(lm.length))
     } catch (e) {
-      Alert.alert('불러오기 실패', String((e as Error).message))
+      Alert.alert(t('place.loadFail'), String((e as Error).message))
     } finally {
       setLoading(false)
     }
@@ -488,6 +742,7 @@ export function PlaceDetailSheet({
     } else {
       setCurrentId(null)
       setDetail(null)
+      setLocalMediaList([])
       setVisitedAt(todayIso())
       setIsSaved(true)
     }
@@ -509,13 +764,40 @@ export function PlaceDetailSheet({
     actionScrollRef.current?.scrollTo({ x: 0, animated: false })
   }, [googlePlaceId, visible])
 
+  // 사용자 별점 로드 (로컬, googlePlaceId 기준)
+  useEffect(() => {
+    if (!googlePlaceId) {
+      setUserRating(null)
+      return
+    }
+    let cancelled = false
+    AsyncStorage.getItem(RATING_STORAGE_PREFIX + googlePlaceId)
+      .then((v) => {
+        if (!cancelled) setUserRating(v != null ? Number(v) : null)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [googlePlaceId])
+
+  const commitRating = (r: number) => {
+    setRatingEditorVisible(false)
+    const val = r > 0 ? r : null
+    setUserRating(val)
+    if (googlePlaceId) {
+      if (val != null) void AsyncStorage.setItem(RATING_STORAGE_PREFIX + googlePlaceId, String(val)).catch(() => {})
+      else void AsyncStorage.removeItem(RATING_STORAGE_PREFIX + googlePlaceId).catch(() => {})
+    }
+  }
+
   useEffect(() => {
     if (!visible || !googlePlaceId) {
       setPlaceDetails(null)
       return
     }
     let cancelled = false
-    fetchPlaceDetails(googlePlaceId)
+    withRetry(() => fetchPlaceDetails(googlePlaceId))
       .then((d) => {
         if (!cancelled) setPlaceDetails(d)
       })
@@ -525,37 +807,15 @@ export function PlaceDetailSheet({
     }
   }, [visible, googlePlaceId])
 
-  const placeName = detail?.place?.display_name ?? searchPlace?.name ?? '장소'
+  const placeName = detail?.place?.display_name ?? searchPlace?.name ?? t('place.place')
   const placeAddress = detail?.place?.address ?? searchPlace?.address ?? null
-  const media = detail?.media ?? []
+  const media = useMemo(() => localMediaList.map(localToMedia), [localMediaList])
 
-  // 하이브리드 렌더 우선순위: 기기 원본(local) → 서버 썸네일/원본
-  // 영상은 앱 문서 폴더 캐시(file://, 재생 보장) 우선 — ph:// 는 expo-video 재생 불가
+  // 모든 미디어가 로컬 file:// — id → uri 매핑
   const [localUris, setLocalUris] = useState<Record<string, string>>({})
   useEffect(() => {
-    const mediaList = detail?.media ?? []
-    if (!mediaList.length) {
-      setLocalUris({})
-      return
-    }
-    let cancelled = false
-    ;(async () => {
-      const entries: Array<[string, string]> = []
-      for (const m of mediaList) {
-        let uri: string | null = null
-        if (m.media_type === 'video') {
-          uri = await localVideoUri(m.id)
-        } else if (m.local_asset_id) {
-          uri = await resolveLocalAssetUri(m.local_asset_id)
-        }
-        if (uri) entries.push([m.id, uri])
-      }
-      if (!cancelled) setLocalUris(Object.fromEntries(entries))
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [detail])
+    setLocalUris(Object.fromEntries(localMediaList.map((m) => [m.id, m.uri])))
+  }, [localMediaList])
 
   // 사진 표시용: 로컬 원본 → 서버 썸네일
   const photoUri = (m: Media): string | null => localUris[m.id] ?? thumbUri(m)
@@ -572,27 +832,29 @@ export function PlaceDetailSheet({
   // 저장 버튼: 미저장 → 목록 선택 모달, 저장됨 → 해제 confirm
   const handleSave = async () => {
     if (!userId) {
-      Alert.alert('로그인 필요', '저장하려면\n먼저 로그인해야 해요.')
+      Alert.alert(t('auth.loginNeeded'), t('place.saveNeedLogin'))
       return
     }
     if (saving) return
     if (currentId && isSaved) {
-      Alert.alert('저장 해제', '저장 목록에서 제거할까요?', [
-        { text: '취소', style: 'cancel' },
+      Alert.alert(t('place.unsave'), t('place.removeSaved'), [
+        { text: t('common.cancel'), style: 'cancel' },
         {
-          text: '제거',
+          text: t('common.remove'),
           style: 'destructive',
           onPress: async () => {
             setSaving(true)
             const listId = detail?.memory.saved_list_id ?? null
             try {
+              // 로컬 미디어 먼저 정리
+              for (const lm of localMediaList) await deleteLocalMedia(currentId, lm.id)
               await deleteVisitMemory(currentId)
               if (listId) await deleteListIfEmpty(listId)
               onDeleted?.(currentId)
               onChanged?.()
               onClose()
             } catch (e) {
-              Alert.alert('삭제 실패', String((e as Error).message))
+              Alert.alert(t('media.deleteFail'), String((e as Error).message))
             } finally {
               setSaving(false)
             }
@@ -640,7 +902,7 @@ export function PlaceDetailSheet({
         showInterstitial()
       }
     } catch (e) {
-      Alert.alert('저장 실패', String((e as Error).message))
+      Alert.alert(t('place.saveFail'), String((e as Error).message))
     } finally {
       setSaving(false)
     }
@@ -654,52 +916,66 @@ export function PlaceDetailSheet({
       setNewListName('')
       await saveToList(list.id)
     } catch (e) {
-      Alert.alert('목록 생성 실패', String((e as Error).message))
+      Alert.alert(t('media.listCreateFail'), String((e as Error).message))
     }
   }
 
   const slotLayoutsRef = useRef<Record<number, { width: number; height: number }>>({})
 
-  const uploadPickedPhoto = async (
+  // 편집 완료된 미디어를 기기 로컬에 저장 (DB/서버 미사용)
+  const savePickedMediaLocal = async (
     uri: string,
     picked: Awaited<ReturnType<typeof pickMedia>>,
-    slotIndex: number
+    slotIndex: number,
+    videoMeta?: {
+      startTime: number
+      endTime: number
+      boxWFrac: number
+      boxHFrac: number
+      offsetXFrac: number
+      offsetYFrac: number
+    }
   ): Promise<boolean> => {
-    if (!picked || !userId || !currentId) return false
-    const uploaded = await uploadMedia(userId, currentId, uri, picked.mediaType)
-    const created = await addMediaToVisit({
+    if (!picked || !currentId) return false
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const ext = picked.mediaType === 'video' ? 'mp4' : 'jpg'
+    const localUri = await persistLocalFile(id, ext, uri)
+    await addLocalMedia({
+      id,
       visitId: currentId,
-      storagePath: uploaded.storagePath,
-      localAssetId: picked.assetId,
       mediaType: picked.mediaType,
-      durationSeconds: picked.durationSeconds,
-      thumbnail128: uploaded.thumbnail128,
-      thumbnail512: uploaded.thumbnail512,
+      uri: localUri,
       width: picked.width,
       height: picked.height,
-      capturedAt: picked.capturedAt,
-      latitude: picked.latitude,
-      longitude: picked.longitude,
       sortOrder: slotIndex,
+      videoStartTime: videoMeta?.startTime ?? null,
+      videoEndTime: videoMeta?.endTime ?? null,
+      boxWFrac: videoMeta?.boxWFrac ?? null,
+      boxHFrac: videoMeta?.boxHFrac ?? null,
+      offsetXFrac: videoMeta?.offsetXFrac ?? null,
+      offsetYFrac: videoMeta?.offsetYFrac ?? null,
     })
-    if (picked.mediaType === 'video') {
-      await cacheVideoLocally(created.id, picked.uri).catch(() => {})
-    }
     return true
   }
 
   // slot 단위 사진 선택→편집→업로드→DB insert. sort_order = slotIndex 로 위치 영속.
   const pickAndUploadToSlot = async (slotIndex: number): Promise<boolean> => {
     if (!userId) {
-      Alert.alert('로그인 필요', '사진/영상을 추가하려면\n먼저 로그인해주세요.')
+      Alert.alert(t('auth.loginNeeded'), t('media.addPhotoNeedLogin'))
       return false
     }
     if (!currentId) {
-      Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
+      Alert.alert(t('place.saveNeedSave'), t('media.addPhotoNeedSave'))
       return false
     }
     const picked = await pickMedia()
     if (!picked) return false
+
+    // 0.5초 이하 영상은 너무 짧아 트림 불가
+    if (picked.mediaType === 'video' && (picked.durationSeconds ?? 0) <= 0.5) {
+      Alert.alert(t('media.videoTooShort'), t('media.videoTooShortMsg'))
+      return false
+    }
 
     // 영상: 트림 편집 → 위치 편집 → 업로드
     if (picked.mediaType === 'video') {
@@ -740,11 +1016,11 @@ export function PlaceDetailSheet({
 
   const showMediaError = (e: unknown) => {
     if (e instanceof VideoTooLongError) {
-      Alert.alert('영상이 너무 길어요', `${MAX_VIDEO_SECONDS}초 이하 영상만 추가할 수 있어요.`)
+      Alert.alert(t('media.videoTooLong'), t('media.videoTooLongMsg', { seconds: MAX_VIDEO_SECONDS }))
     } else if ((e as Error).message === 'PERMISSION_DENIED') {
-      Alert.alert('권한 필요', '사진 라이브러리 접근 권한이 필요해요.')
+      Alert.alert(t('media.permissionNeeded'), t('media.libraryPermission'))
     } else {
-      Alert.alert('사진 처리 실패', String((e as Error).message))
+      Alert.alert(t('media.processFail'), String((e as Error).message))
     }
   }
 
@@ -766,11 +1042,13 @@ export function PlaceDetailSheet({
 
   const doDeleteMedia = async (m: Media) => {
     try {
-      await deleteMedia(m)
-      if (currentId) await load(currentId)
+      if (currentId) {
+        await deleteLocalMedia(currentId, m.id)
+        await load(currentId)
+      }
       onChanged?.()
     } catch (e) {
-      Alert.alert('삭제 실패', String((e as Error).message))
+      Alert.alert(t('media.deleteFail'), String((e as Error).message))
     }
   }
 
@@ -778,10 +1056,11 @@ export function PlaceDetailSheet({
     if (mediaBusy) return
     setMediaBusy(true)
     try {
-      // 새 사진 업로드 성공 후에만 기존 사진 삭제 (실패 시 기존 유지)
+      // 새 사진 추가 성공 후에만 기존 사진 삭제 (실패 시 기존 유지).
+      // addLocalMedia 가 같은 slotIndex 를 교체하므로 old 가 곧 새 항목이면 삭제 생략
       const added = await pickAndUploadToSlot(slotIndex)
       if (added) {
-        await deleteMedia(old)
+        if (currentId && old.sort_order !== slotIndex) await deleteLocalMedia(currentId, old.id)
         if (currentId) await load(currentId)
         onChanged?.()
       }
@@ -793,17 +1072,17 @@ export function PlaceDetailSheet({
   }
 
   const handleFilledSlotPress = (m: Media, slotIndex: number) => {
-    Alert.alert('사진', '이 사진을 어떻게 할까요?', [
-      { text: '교체', onPress: () => void handleReplaceSlot(m, slotIndex) },
-      { text: '삭제', style: 'destructive', onPress: () => void doDeleteMedia(m) },
-      { text: '취소', style: 'cancel' },
+    Alert.alert(t('media.photos'), t('media.photoOptions'), [
+      { text: t('common.replace'), onPress: () => void handleReplaceSlot(m, slotIndex) },
+      { text: t('common.delete'), style: 'destructive', onPress: () => void doDeleteMedia(m) },
+      { text: t('common.cancel'), style: 'cancel' },
     ])
   }
 
   const handleDeleteMedia = (m: Media) => {
-    Alert.alert('사진 삭제', '이 사진을 삭제할까요?', [
-      { text: '취소', style: 'cancel' },
-      { text: '삭제', style: 'destructive', onPress: () => void doDeleteMedia(m) },
+    Alert.alert(t('media.deletePhoto'), t('media.deletePhotoConfirm'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      { text: t('common.delete'), style: 'destructive', onPress: () => void doDeleteMedia(m) },
     ])
   }
 
@@ -820,7 +1099,7 @@ export function PlaceDetailSheet({
   const handleEditToggle = async () => {
     if (!isEditing) {
       if (!currentId) {
-        Alert.alert('저장 필요', '사진을 추가하려면\n먼저 장소를 저장해주세요.')
+        Alert.alert(t('place.saveNeedSave'), t('media.addPhotoNeedSave'))
         return
       }
       animateLayout()
@@ -846,12 +1125,12 @@ export function PlaceDetailSheet({
     if (phone) {
       Linking.openURL(`tel:${phone.replace(/[^+\d]/g, '')}`).catch(() => {})
     } else {
-      Alert.alert('통화', '전화번호 정보가 없습니다')
+      Alert.alert(t('place.call'), t('place.noPhone'))
     }
   }
 
   const handleUnsupported = (featureName: string) => {
-    Alert.alert(featureName, UNSUPPORTED_MSG)
+    Alert.alert(featureName, t('common.unsupported'))
   }
 
   const openViewer = (index: number) => {
@@ -892,18 +1171,20 @@ export function PlaceDetailSheet({
   // 영상 재생 소스 없으면 (로컬 소실 + 미공유) 포스터 썸네일로 fallback
   const renderSlotContent = (m: Media) => {
     if (m.media_type === 'video') {
-      const v = videoUri(m)
+      const v = localUris[m.id] ?? null  // localUris 완전 로드 후에만 사용
       if (v) {
-        // pointerEvents none — 탭은 바깥 Pressable이 받음
         return (
           <View style={styles.videoFill} pointerEvents="none">
-            <SlotVideo uri={v} />
+            <SlotVideo key={v} uri={v} meta={{ startTime: m.video_start_time, endTime: m.video_end_time, boxWFrac: m.video_box_w_frac, boxHFrac: m.video_box_h_frac, offsetXFrac: m.video_offset_x_frac, offsetYFrac: m.video_offset_y_frac }} />
           </View>
         )
       }
+      // 로컬 없으면 썸네일 poster
+      const poster = thumbUri(m)
+      return poster ? <RetryImage uri={poster} style={styles.photoImage} /> : null
     }
     const uri = photoUri(m)
-    return uri ? <Image source={{ uri }} style={styles.photoImage} /> : null
+    return uri ? <RetryImage uri={uri} style={styles.photoImage} /> : null
   }
 
   const renderSlot = (slotIndex: number, style: object, editing: boolean) => {
@@ -936,7 +1217,7 @@ export function PlaceDetailSheet({
           ) : (
             <>
               <Image source={require('../../assets/icons/camera.png')} style={styles.editAddIconImg} />
-              <Text style={styles.editAddLabel}>사진 추가</Text>
+              <Text style={styles.editAddLabel}>{t('media.addPhoto')}</Text>
             </>
           )}
         </Pressable>
@@ -1026,8 +1307,8 @@ export function PlaceDetailSheet({
       return (
         <View style={styles.photoEmpty}>
           <Image source={require('../../assets/icons/camera.png')} style={styles.photoEmptyIconImg} />
-          <Text style={styles.photoEmptyTitle}>아직 사진이 없습니다</Text>
-          <Text style={styles.photoEmptySub}>수정 버튼을 눌러 사진을 추가하세요</Text>
+          <Text style={styles.photoEmptyTitle}>{t('media.noPhotosTitle')}</Text>
+          <Text style={styles.photoEmptySub}>{t('media.noPhotosSub')}</Text>
         </View>
       )
     }
@@ -1037,7 +1318,7 @@ export function PlaceDetailSheet({
   const renderEditPhotos = () => (
     <View style={styles.photoSection}>
       <Pressable style={styles.layoutSelectBtn} onPress={() => setLayoutPickerVisible(true)}>
-        <Text style={styles.layoutSelectText}>레이아웃 선택</Text>
+        <Text style={styles.layoutSelectText}>{t('place.layoutSelect')}</Text>
       </Pressable>
       {renderLayoutGrid(true)}
     </View>
@@ -1062,7 +1343,7 @@ export function PlaceDetailSheet({
     pending?.resolve(false)
   }
 
-  const handleVideoPositionConfirm = async (_ox: number, _oy: number, _scale: number) => {
+  const handleVideoPositionConfirm = async (pos: PositionResult) => {
     const pending = pendingPickRef.current
     const editor = videoPositionEditor
     setVideoPositionEditor(null)
@@ -1070,7 +1351,17 @@ export function PlaceDetailSheet({
     if (!pending || !editor) return
     try {
       setMediaBusy(true)
-      const ok = await uploadPickedPhoto(editor.uri, pending.picked, editor.slotIndex)
+      const trimmedPicked = pending.picked
+        ? { ...pending.picked, durationSeconds: editor.trim.duration }
+        : pending.picked
+      const ok = await savePickedMediaLocal(editor.uri, trimmedPicked, editor.slotIndex, {
+        startTime: editor.trim.startTime,
+        endTime: editor.trim.endTime,
+        boxWFrac: pos.boxWFrac,
+        boxHFrac: pos.boxHFrac,
+        offsetXFrac: pos.offsetXFrac,
+        offsetYFrac: pos.offsetYFrac,
+      })
       if (ok && currentId) {
         await load(currentId)
         onChanged?.()
@@ -1098,7 +1389,7 @@ export function PlaceDetailSheet({
     if (!pending) return
     try {
       setMediaBusy(true)
-      const ok = await uploadPickedPhoto(croppedUri, pending.picked, cropEditor?.slotIndex ?? 0)
+      const ok = await savePickedMediaLocal(croppedUri, pending.picked, cropEditor?.slotIndex ?? 0)
       if (ok && currentId) {
         await load(currentId)
         onChanged?.()
@@ -1136,7 +1427,7 @@ export function PlaceDetailSheet({
         videoWidth={videoPositionEditor.width}
         videoHeight={videoPositionEditor.height}
         slotAspect={videoPositionEditor.slotAspect}
-        onConfirm={(ox, oy, s) => void handleVideoPositionConfirm(ox, oy, s)}
+        onConfirm={(r) => void handleVideoPositionConfirm(r)}
         onCancel={handleVideoPositionCancel}
       />
     )}
@@ -1148,6 +1439,13 @@ export function PlaceDetailSheet({
         slotAspect={cropEditor.slotAspect}
         onConfirm={(uri) => void handleCropConfirm(uri)}
         onCancel={handleCropCancel}
+      />
+    )}
+    {ratingEditorVisible && (
+      <RatingEditor
+        initial={userRating ?? 0}
+        onConfirm={commitRating}
+        onCancel={() => setRatingEditorVisible(false)}
       />
     )}
     <Modal visible={visible} transparent animationType="none" onRequestClose={onClose}>
@@ -1194,17 +1492,30 @@ export function PlaceDetailSheet({
                     </Text>
                   ) : null}
 
-                  {placeDetails?.rating != null && (
-                    <View style={styles.ratingRow}>
-                      <Text style={styles.ratingNumber}>{placeDetails.rating.toFixed(1)}</Text>
-                      {renderStars(placeDetails.rating)}
-                      {placeDetails.userRatingCount != null && (
-                        <Text style={styles.reviewCount}>
-                          ({placeDetails.userRatingCount.toLocaleString()})
-                        </Text>
-                      )}
-                    </View>
-                  )}
+                  <Pressable style={styles.ratingRow} onPress={() => setRatingEditorVisible(true)}>
+                    {userRating != null ? (
+                      <>
+                        <Text style={styles.ratingNumber}>{userRating.toFixed(1)}</Text>
+                        <Stars value={userRating} size={15} />
+                        <Text style={styles.reviewCount}>{t('rating.myRating')}</Text>
+                      </>
+                    ) : placeDetails?.rating != null ? (
+                      <>
+                        <Text style={styles.ratingNumber}>{placeDetails.rating.toFixed(1)}</Text>
+                        <Stars value={placeDetails.rating} size={15} />
+                        {placeDetails.userRatingCount != null && (
+                          <Text style={styles.reviewCount}>
+                            ({placeDetails.userRatingCount.toLocaleString()})
+                          </Text>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <Stars value={0} size={15} />
+                        <Text style={styles.reviewCount}>{t('rating.rateThis')}</Text>
+                      </>
+                    )}
+                  </Pressable>
 
                   {placeDetails?.primaryTypeDisplayName?.text ? (
                     <Text style={styles.category}>{placeDetails.primaryTypeDisplayName.text}</Text>
@@ -1212,7 +1523,7 @@ export function PlaceDetailSheet({
 
                   {openNow != null && (
                     <Text style={[styles.statusText, openNow ? styles.statusOpen : styles.statusClosed]}>
-                      {openNow ? '영업 중' : '영업 종료'}
+                      {openNow ? t('place.openNow') : t('place.closedNow')}
                     </Text>
                   )}
                 </View>
@@ -1232,7 +1543,7 @@ export function PlaceDetailSheet({
                       style={[styles.headerIcon, isSaved && currentId != null && styles.headerIconActive]}
                     />
                   </Pressable>
-                  <Pressable style={styles.headerIconBtn} onPress={() => handleUnsupported('공유')}>
+                  <Pressable style={styles.headerIconBtn} onPress={() => handleUnsupported(t('place.share'))}>
                     <Image source={require('../../assets/icons/share.png')} style={styles.headerIcon} />
                   </Pressable>
                   <Pressable style={styles.headerIconBtn} onPress={() => closeSheet()}>
@@ -1251,21 +1562,21 @@ export function PlaceDetailSheet({
               >
                 <Pressable
                   style={[styles.actionBtn, styles.actionBtnPrimary]}
-                  onPress={() => handleUnsupported('경로')}
+                  onPress={() => handleUnsupported(t('place.route'))}
                 >
                   <Image source={require('../../assets/icons/direction.png')} style={styles.actionIcon} />
-                  <Text style={styles.actionBtnTextPrimary}>경로</Text>
+                  <Text style={styles.actionBtnTextPrimary}>{t('place.route')}</Text>
                 </Pressable>
                 <Pressable
                   style={[styles.actionBtn, styles.actionBtnSecondary]}
-                  onPress={() => handleUnsupported('시작')}
+                  onPress={() => handleUnsupported(t('common.start'))}
                 >
                   <Image source={require('../../assets/icons/navigate.png')} style={styles.actionIcon} />
-                  <Text style={styles.actionBtnText}>시작</Text>
+                  <Text style={styles.actionBtnText}>{t('common.start')}</Text>
                 </Pressable>
                 <Pressable style={[styles.actionBtn, styles.actionBtnSecondary]} onPress={handleCall}>
                   <Image source={require('../../assets/icons/phone.png')} style={styles.actionIcon} />
-                  <Text style={styles.actionBtnText}>통화</Text>
+                  <Text style={styles.actionBtnText}>{t('place.call')}</Text>
                 </Pressable>
                 <Pressable
                   style={[styles.actionBtn, styles.actionBtnSecondary]}
@@ -1281,7 +1592,7 @@ export function PlaceDetailSheet({
                     style={styles.actionIcon}
                   />
                   <Text style={styles.actionBtnText}>
-                    {isSaved && currentId != null ? '저장됨' : '저장'}
+                    {isSaved && currentId != null ? t('place.saved') : t('place.save')}
                   </Text>
                 </Pressable>
               </ScrollView>
@@ -1325,7 +1636,7 @@ export function PlaceDetailSheet({
                         }}
                       >
                         <Image source={require('../../assets/icons/clock.png')} style={styles.infoIcon} />
-                        <Text style={styles.infoLabel}>영업시간</Text>
+                        <Text style={styles.infoLabel}>{t('place.hours')}</Text>
                         <Image
                           source={
                             hoursExpanded
@@ -1364,7 +1675,7 @@ export function PlaceDetailSheet({
                     <ActivityIndicator size="small" color={COLORS.white} />
                   ) : (
                     <Text style={[styles.editButtonText, isEditing && styles.editButtonTextActive]}>
-                      {isEditing ? '수정완료' : '수정'}
+                      {isEditing ? t('common.done') : t('common.edit')}
                     </Text>
                   )}
                 </Pressable>
@@ -1383,7 +1694,7 @@ export function PlaceDetailSheet({
       >
         <Pressable style={styles.pickerBackdrop} onPress={() => setLayoutPickerVisible(false)}>
           <Pressable style={styles.pickerCard} onPress={() => {}}>
-            <Text style={styles.pickerTitle}>레이아웃 선택</Text>
+            <Text style={styles.pickerTitle}>{t('place.layoutSelect')}</Text>
             <View style={styles.pickerGrid}>
               {LAYOUT_OPTIONS.map((opt) => (
                 <Pressable
@@ -1416,11 +1727,11 @@ export function PlaceDetailSheet({
       >
         <Pressable style={styles.pickerBackdrop} onPress={() => setSavePickerVisible(false)}>
           <Pressable style={styles.pickerCard} onPress={() => {}}>
-            <Text style={styles.pickerTitle}>저장할 목록</Text>
+            <Text style={styles.pickerTitle}>{t('place.selectList')}</Text>
 
             <Pressable style={styles.listRow} onPress={() => void saveToList(null)}>
               <View style={[styles.listDot, styles.listDotNone]} />
-              <Text style={styles.listRowText}>목록 없이 저장</Text>
+              <Text style={styles.listRowText}>{t('place.saveNoList')}</Text>
             </Pressable>
 
             {saveLists.map((list) => (
@@ -1431,10 +1742,10 @@ export function PlaceDetailSheet({
             ))}
 
             <View style={styles.listCreateDivider} />
-            <Text style={styles.listCreateLabel}>새 목록 만들기</Text>
+            <Text style={styles.listCreateLabel}>{t('place.createNewList')}</Text>
             <TextInput
               style={styles.listNameInput}
-              placeholder="목록 이름"
+              placeholder={t('media.listNamePlaceholder')}
               placeholderTextColor="#9AA0A6"
               value={newListName}
               onChangeText={setNewListName}
@@ -1458,7 +1769,7 @@ export function PlaceDetailSheet({
               onPress={() => void handleCreateList()}
               disabled={!newListName.trim()}
             >
-              <Text style={styles.listCreateBtnText}>만들고 저장</Text>
+              <Text style={styles.listCreateBtnText}>{t('place.createAndSave')}</Text>
             </Pressable>
           </Pressable>
         </Pressable>
@@ -1510,9 +1821,9 @@ export function PlaceDetailSheet({
                 return (
                   <View style={styles.viewerPage}>
                     {v ? (
-                      <ViewerVideo uri={v} active={index === viewerIndex} />
+                      <ViewerVideo uri={v} active={index === viewerIndex} meta={{ startTime: item.video_start_time, endTime: item.video_end_time }} />
                     ) : poster ? (
-                      <Image source={{ uri: poster }} style={styles.viewerImage} resizeMode="contain" />
+                      <RetryImage uri={poster} style={styles.viewerImage} />
                     ) : null}
                   </View>
                 )
@@ -1521,7 +1832,7 @@ export function PlaceDetailSheet({
               return (
                 <View style={styles.viewerPage}>
                   {uri ? (
-                    <Image source={{ uri }} style={styles.viewerImage} resizeMode="contain" />
+                    <RetryImage uri={uri} style={styles.viewerImage} />
                   ) : null}
                 </View>
               )

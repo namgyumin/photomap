@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   ActivityIndicator,
   Alert,
@@ -10,13 +11,25 @@ import {
   View,
 } from 'react-native'
 import MapView, { Marker } from 'react-native-maps'
+import Svg, { Circle, Path } from 'react-native-svg'
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { SafeAreaView } from 'react-native-safe-area-context'
-import { resolveMediaUri } from '../../src/lib/media'
+import { listLocalMedia } from '../../src/lib/localMedia'
 import { listMyMemories, listSavedLists } from '../../src/services/memories'
 import type { MemoryListItem, SavedList } from '../../src/types/database'
 
+function MapPin({ color = '#111111', size = 36 }: { color?: string; size?: number }) {
+  const w = size * 0.72
+  return (
+    <Svg width={w} height={size} viewBox="0 0 36 50">
+      <Path d="M18 0C8.06 0 0 8.06 0 18c0 13.5 18 32 18 32S36 31.5 36 18C36 8.06 27.94 0 18 0z" fill={color} />
+      <Circle cx="18" cy="18" r="8" fill="white" opacity={0.9} />
+    </Svg>
+  )
+}
+
 export default function SavedListScreen() {
+  const { t } = useTranslation()
   const router = useRouter()
   const { id } = useLocalSearchParams<{ id: string }>()
   const mapRef = useRef<MapView>(null)
@@ -24,6 +37,7 @@ export default function SavedListScreen() {
   const [list, setList] = useState<SavedList | null>(null)
   const [items, setItems] = useState<MemoryListItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [localInfo, setLocalInfo] = useState<Record<string, { uri: string | null; count: number }>>({})
 
   const load = useCallback(async () => {
     if (!id) return
@@ -32,9 +46,16 @@ export default function SavedListScreen() {
       const [lists, memories] = await Promise.all([listSavedLists(), listMyMemories()])
       const found = lists.find((l) => l.id === id) ?? null
       setList(found)
-      setItems(memories.filter((m) => m.saved_list_id === id))
+      const mine = memories.filter((m) => m.saved_list_id === id)
+      setItems(mine)
+      const info: Record<string, { uri: string | null; count: number }> = {}
+      for (const m of mine) {
+        const lm = await listLocalMedia(m.id)
+        info[m.id] = { uri: lm[0]?.uri ?? null, count: lm.length }
+      }
+      setLocalInfo(info)
     } catch (e) {
-      Alert.alert('불러오기 실패', String((e as Error).message))
+      Alert.alert(t('place.loadFail'), String((e as Error).message))
     } finally {
       setLoading(false)
     }
@@ -80,9 +101,9 @@ export default function SavedListScreen() {
         </Pressable>
         <View style={[styles.titleDot, { backgroundColor: color }]} />
         <Text style={styles.title} numberOfLines={1}>
-          {list?.name ?? '목록'}
+          {list?.name ?? t('list.list')}
         </Text>
-        <Text style={styles.count}>{items.length}곳</Text>
+        <Text style={styles.count}>{items.length} {t('map.places')}</Text>
       </View>
 
       {loading ? (
@@ -101,23 +122,21 @@ export default function SavedListScreen() {
                   <Marker
                     key={it.id}
                     coordinate={{ latitude: it.place!.latitude!, longitude: it.place!.longitude! }}
-                    title={it.place!.display_name ?? '장소'}
+                    title={it.place!.display_name ?? t('map.place')}
                     tracksViewChanges={false}
                     onPress={() => openOnMap(it.id)}
                   >
-                    <View style={[styles.markerDot, { backgroundColor: color }]}>
-                      <View style={styles.markerInner} />
-                    </View>
+                    <MapPin color={color ?? '#111111'} size={32} />
                   </Marker>
                 ))}
               </MapView>
             ) : null
           }
           ListEmptyComponent={
-            <Text style={styles.emptyBody}>이 목록에 저장된 장소가 아직 없어요.</Text>
+            <Text style={styles.emptyBody}>{t('list.empty')}</Text>
           }
           renderItem={({ item }) => {
-            const thumb = resolveMediaUri(item.hero?.thumbnail_512 ?? item.hero?.storage_path ?? null)
+            const thumb = localInfo[item.id]?.uri ?? null
             return (
               <Pressable style={styles.card} onPress={() => openOnMap(item.id)}>
                 {thumb ? (
@@ -128,9 +147,9 @@ export default function SavedListScreen() {
                   </View>
                 )}
                 <View style={styles.cardBody}>
-                  <Text style={styles.cardTitle}>{item.place?.display_name ?? '장소'}</Text>
+                  <Text style={styles.cardTitle}>{item.place?.display_name ?? t('map.place')}</Text>
                   <Text style={styles.cardMeta}>
-                    {item.visited_at?.slice(0, 10)} · 사진 {item.media_count}
+                    {item.visited_at?.slice(0, 10)} · {t('media.photos')} {localInfo[item.id]?.count ?? 0}
                   </Text>
                   {item.note ? (
                     <Text style={styles.cardNote} numberOfLines={2}>

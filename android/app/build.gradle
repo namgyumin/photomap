@@ -92,11 +92,11 @@ android {
         applicationId 'com.namgyumin.photomap'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        versionCode 9
         versionName "1.0.0"
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
-        manifestPlaceholders = [GOOGLE_MAPS_API_KEY: System.getenv("ANDROID_MAPS_KEY") ?: System.getenv("GOOGLE_MAPS_API_KEY") ?: ""]
+        manifestPlaceholders = [ANDROID_MAPS_KEY: System.getenv("ANDROID_MAPS_KEY") ?: ""]
     }
     signingConfigs {
         debug {

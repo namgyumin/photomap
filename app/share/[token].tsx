@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -7,6 +8,7 @@ import { getSharedMemoryByToken } from '../../src/services/memories'
 import type { SharedMemory } from '../../src/types/database'
 
 export default function ShareTokenScreen() {
+  const { t } = useTranslation()
   const router = useRouter()
   const { token } = useLocalSearchParams<{ token?: string }>()
   const { userId, loading: authLoading } = useAuth()
@@ -18,7 +20,7 @@ export default function ShareTokenScreen() {
     const value = typeof token === 'string' ? token.trim() : ''
     if (!value) {
       setShared(null)
-      setLoadError('공유 토큰이 없어요.')
+      setLoadError(t('import.noToken'))
       return
     }
 
@@ -28,7 +30,7 @@ export default function ShareTokenScreen() {
       .then((result) => {
         if (!result) {
           setShared(null)
-          setLoadError('공유 기록을 찾을 수 없어요.')
+          setLoadError(t('import.notFound'))
           return
         }
         setShared(result)
@@ -43,7 +45,7 @@ export default function ShareTokenScreen() {
   const goToImport = () => {
     const value = typeof token === 'string' ? token.trim() : ''
     if (!value) {
-      Alert.alert('토큰 오류', '유효한 공유 토큰이 없어요.')
+      Alert.alert(t('auth.tokenError'), t('import.invalidToken'))
       return
     }
     if (!userId) {
@@ -53,14 +55,14 @@ export default function ShareTokenScreen() {
     router.replace({ pathname: '/(tabs)/memories', params: { token: value, autoImport: '1' } })
   }
 
-  const placeName = shared?.place?.display_name ?? '공유 기록'
+  const placeName = shared?.place?.display_name ?? t('import.sharedMemory')
   const visitedAt = shared?.visit.visited_at?.slice(0, 10)
   const mediaCount = shared?.media.length ?? 0
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       <View style={styles.card}>
-        <Text style={styles.eyebrow}>PhotoMap 공유</Text>
+        <Text style={styles.eyebrow}>{t('import.shareTitle')}</Text>
         <Text style={styles.title}>{placeName}</Text>
         {visitedAt ? <Text style={styles.meta}>{visitedAt}</Text> : null}
 
@@ -70,31 +72,27 @@ export default function ShareTokenScreen() {
 
         {shared ? (
           <View style={styles.summaryBox}>
-            <Text style={styles.summaryLine}>사진/영상 {mediaCount}개</Text>
+            <Text style={styles.summaryLine}>{t('import.photoCount', { count: mediaCount })}</Text>
             {shared.visit.note ? (
               <Text style={styles.note} numberOfLines={4}>
                 {shared.visit.note}
               </Text>
             ) : (
-              <Text style={styles.noteMuted}>작성된 메모는 없어요.</Text>
+              <Text style={styles.noteMuted}>{t('import.noNote')}</Text>
             )}
           </View>
         ) : null}
 
         <Pressable style={styles.primaryBtn} onPress={goToImport}>
           <Text style={styles.primaryBtnText}>
-            {userId ? '내 기록으로 가져오기' : '로그인 후 가져오기'}
+            {userId ? t('import.importShared') : t('auth.loginToImport')}
           </Text>
         </Pressable>
 
         {!userId ? (
-          <Text style={styles.helper}>
-            아직 로그인 전이면 이 화면에서 내용을 먼저 확인하고, 로그인 후 다시 링크를 열면 돼요.
-          </Text>
+          <Text style={styles.helper}>{t('import.loginFirst')}</Text>
         ) : (
-          <Text style={styles.helper}>
-            버튼을 누르면 기록 탭으로 이동해 가져오기 방식을 선택할 수 있어요.
-          </Text>
+          <Text style={styles.helper}>{t('import.importHint')}</Text>
         )}
       </View>
     </SafeAreaView>

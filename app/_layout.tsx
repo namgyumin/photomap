@@ -1,9 +1,12 @@
 import { Stack, useRouter, useSegments } from 'expo-router'
 import { useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native'
 import { useAuth } from '../src/hooks/useAuth'
+import '../src/i18n'
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
+  const { t } = useTranslation()
   const { session, loading } = useAuth()
   const segments = useSegments()
   const router = useRouter()
@@ -23,7 +26,7 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
     return (
       <View style={styles.loading}>
         <ActivityIndicator />
-        <Text style={styles.loadingText}>photomap 불러오는 중…</Text>
+        <Text style={styles.loadingText}>{t('app.loading')}</Text>
       </View>
     )
   }

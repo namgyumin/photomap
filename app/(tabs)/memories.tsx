@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
@@ -19,12 +20,13 @@ const BANNER_AD_UNIT_ID = __DEV__
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { SharedImportModal } from '../../src/components/SharedImportModal'
-import { resolveMediaUri } from '../../src/lib/media'
+import { listLocalMedia } from '../../src/lib/localMedia'
 import { importSharedMemory, listMyMemories, listSavedLists } from '../../src/services/memories'
 import type { ImportMode, MemoryListItem, SavedList } from '../../src/types/database'
 import { useAuth } from '../../src/hooks/useAuth'
 
 export default function MemoriesScreen() {
+  const { t } = useTranslation()
   const { userId, loading: authLoading } = useAuth()
   const router = useRouter()
   const params = useLocalSearchParams<{ token?: string; autoImport?: string }>()
@@ -36,6 +38,7 @@ export default function MemoriesScreen() {
   const [token, setToken] = useState('')
   const [importVisible, setImportVisible] = useState(false)
   const [query, setQuery] = useState('')
+  const [localInfo, setLocalInfo] = useState<Record<string, { uri: string | null; count: number }>>({})
 
   const load = useCallback(async () => {
     if (!userId) {
@@ -48,8 +51,15 @@ export default function MemoriesScreen() {
       const [memories, lists] = await Promise.all([listMyMemories(), listSavedLists()])
       setItems(memories)
       setSavedLists(lists)
+      // 로컬 미디어로 썸네일/개수 채우기
+      const info: Record<string, { uri: string | null; count: number }> = {}
+      for (const m of memories) {
+        const lm = await listLocalMedia(m.id)
+        info[m.id] = { uri: lm[0]?.uri ?? null, count: lm.length }
+      }
+      setLocalInfo(info)
     } catch (e) {
-      Alert.alert('불러오기 실패', String((e as Error).message))
+      Alert.alert(t('place.loadFail'), String((e as Error).message))
     } finally {
       setLoading(false)
     }
@@ -116,18 +126,18 @@ export default function MemoriesScreen() {
     try {
       await importSharedMemory(token.trim(), mode)
       setToken('')
-      Alert.alert('가져오기 완료', '공유 기록을 내 기록으로 가져왔어요.')
+      Alert.alert(t('import.importDone'), t('import.importedMsg'))
       void load()
     } catch (e) {
-      Alert.alert('가져오기 실패', String((e as Error).message))
+      Alert.alert(t('import.importFail'), String((e as Error).message))
     }
   }
 
   if (!authLoading && !userId) {
     return (
       <SafeAreaView style={styles.center} edges={['top']}>
-        <Text style={styles.emptyTitle}>로그인이 필요해요</Text>
-        <Text style={styles.emptyBody}>로그인하면 내가 갔던 곳이 여기 정리돼요.</Text>
+        <Text style={styles.emptyTitle}>{t('profile.loginRequired')}</Text>
+        <Text style={styles.emptyBody}>{t('memories.loginDesc')}</Text>
       </SafeAreaView>
     )
   }
@@ -137,7 +147,7 @@ export default function MemoriesScreen() {
       <View style={styles.searchBar}>
         <TextInput
           style={styles.searchInput}
-          placeholder="내가 갔던 곳 검색"
+          placeholder={t('place.mySearchPlaceholder')}
           value={query}
           onChangeText={setQuery}
           autoCapitalize="none"
@@ -157,7 +167,7 @@ export default function MemoriesScreen() {
             <>
               {savedLists.length > 0 && (
                 <View style={styles.listsSection}>
-                  <Text style={styles.sectionTitle}>목록</Text>
+                  <Text style={styles.sectionTitle}>{t('media.list')}</Text>
                   {savedLists.map((list) => (
                     <Pressable
                       key={list.id}
@@ -166,13 +176,13 @@ export default function MemoriesScreen() {
                     >
                       <View style={[styles.listColorDot, { backgroundColor: list.color }]} />
                       <Text style={styles.listCardName}>{list.name}</Text>
-                      <Text style={styles.listCardCount}>{listCounts.get(list.id) ?? 0}곳</Text>
+                      <Text style={styles.listCardCount}>{listCounts.get(list.id) ?? 0} {t('map.places')}</Text>
                       <Text style={styles.listCardChevron}>›</Text>
                     </Pressable>
                   ))}
                 </View>
               )}
-              {noListItems.length > 0 && <Text style={styles.sectionTitle}>기록</Text>}
+              {noListItems.length > 0 && <Text style={styles.sectionTitle}>{t('tabs.memories')}</Text>}
             </>
           )
         }
@@ -180,13 +190,13 @@ export default function MemoriesScreen() {
           loading ? (
             <ActivityIndicator style={{ marginTop: 40 }} />
           ) : searchMode ? (
-            <Text style={styles.emptyBody}>검색 결과가 없어요.</Text>
+            <Text style={styles.emptyBody}>{t('place.searchFail')}</Text>
           ) : items.length === 0 ? (
-            <Text style={styles.emptyBody}>아직 기록이 없어요. 지도에서 장소를 저장해보세요.</Text>
+            <Text style={styles.emptyBody}>{t('memories.empty')}</Text>
           ) : null
         }
         renderItem={({ item }) => {
-          const thumb = resolveMediaUri(item.hero?.thumbnail_512 ?? item.hero?.storage_path ?? null)
+          const thumb = localInfo[item.id]?.uri ?? null
           return (
             <Pressable style={styles.card} onPress={() => openOnMap(item.id)}>
               {thumb ? (
@@ -197,10 +207,10 @@ export default function MemoriesScreen() {
                 </View>
               )}
               <View style={styles.cardBody}>
-                <Text style={styles.cardTitle}>{item.place?.display_name ?? '장소'}</Text>
+                <Text style={styles.cardTitle}>{item.place?.display_name ?? t('map.place')}</Text>
                 <Text style={styles.cardMeta}>
-                  {item.visited_at?.slice(0, 10)} · 사진 {item.media_count}
-                  {item.amount_spent != null ? ` · ${item.amount_spent.toLocaleString()}원` : ''}
+                  {item.visited_at?.slice(0, 10)} · {t('media.photos')} {localInfo[item.id]?.count ?? 0}
+                  {item.amount_spent != null ? ` · ${item.amount_spent.toLocaleString()}${t('memories.amountUnit')}` : ''}
                 </Text>
                 {item.note ? (
                   <Text style={styles.cardNote} numberOfLines={2}>
